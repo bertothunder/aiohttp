@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Simple multiprocess http server written using an event loop."""
+"""Simple multiprocess HTTP server written using an event loop."""
 
 import argparse
 import os
@@ -12,7 +12,7 @@ import aiohttp
 import aiohttp.server
 from aiohttp import websocket
 
-ARGS = argparse.ArgumentParser(description="Run simple http server.")
+ARGS = argparse.ArgumentParser(description="Run simple HTTP server.")
 ARGS.add_argument(
     '--host', action="store", dest='host',
     default='127.0.0.1', help='Host name')
@@ -43,12 +43,12 @@ class HttpRequestHandler(aiohttp.server.ServerHttpProtocol):
                 isdir = os.path.isdir(path)
 
         if not path:
-            raise aiohttp.HttpProcessingError(404)
+            raise aiohttp.HttpProcessingError(code=404)
 
         if isdir and not path.endswith('/'):
             path = path + '/'
             raise aiohttp.HttpProcessingError(
-                302, headers=(('URI', path), ('Location', path)))
+                code=302, headers=(('URI', path), ('Location', path)))
 
         response = aiohttp.Response(
             self.writer, 200, http_version=message.version)
@@ -280,6 +280,9 @@ class Supervisor:
 
 
 def main():
+    if getattr(os, "fork", None) is None:
+        print("os.fork isn't supported by your OS")
+        return
     args = ARGS.parse_args()
     if ':' in args.host:
         args.host, port = args.host.split(':', 1)

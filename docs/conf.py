@@ -37,6 +37,9 @@ with codecs.open(_version_path, 'r', 'latin1') as fp:
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 sys.path.insert(0, os.path.abspath('..'))
+sys.path.insert(0, os.path.abspath('.'))
+
+import alabaster
 
 # -- General configuration ------------------------------------------------
 
@@ -49,10 +52,28 @@ sys.path.insert(0, os.path.abspath('..'))
 extensions = [
     'sphinx.ext.autodoc',
     'sphinx.ext.viewcode',
-    'sphinx.ext.intersphinx'
+    'sphinx.ext.intersphinx',
+    'alabaster',
+    'sphinxcontrib.asyncio',
+    'sphinxcontrib.newsfeed',
 ]
 
-intersphinx_mapping = {'python': ('http://docs.python.org/3', None)}
+
+try:
+    import sphinxcontrib.spelling  # noqa
+    extensions.append('sphinxcontrib.spelling')
+except ImportError:
+    pass
+
+
+intersphinx_mapping = {
+    'python': ('http://docs.python.org/3', None),
+    'multidict':
+        ('https://multidict.readthedocs.io/en/stable/', None),
+    'aiohttpjinja2':
+        ('https://aiohttp-jinja2.readthedocs.io/en/stable/', None),
+    'aiohttpsession':
+        ('https://aiohttp-session.readthedocs.io/en/stable/', None)}
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
@@ -68,7 +89,7 @@ master_doc = 'index'
 
 # General information about the project.
 project = 'aiohttp'
-copyright = '2014, KeepSafe'
+copyright = '2013-2016, KeepSafe'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
@@ -111,6 +132,9 @@ exclude_patterns = ['_build']
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = 'sphinx'
 
+# The default language to highlight source code in.
+highlight_language = 'python3'
+
 # A list of ignored prefixes for module index sorting.
 # modindex_common_prefix = []
 
@@ -122,15 +146,29 @@ pygments_style = 'sphinx'
 
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
-html_theme = 'default'
+html_theme = 'alabaster'
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
 # documentation.
-# html_theme_options = {}
+html_theme_options = {
+    'logo': 'aiohttp-icon-128x128.png',
+    'description': 'http client/server for asyncio',
+    'github_user': 'KeepSafe',
+    'github_repo': 'aiohttp',
+    'github_button': True,
+    'github_banner': True,
+    'travis_button': True,
+    'pre_bg': '#FFF6E5',
+    'note_bg': '#E5ECD1',
+    'note_border': '#BFCF8C',
+    'body_text': '#482C0A',
+    'sidebar_text': '#49443E',
+    'sidebar_header': '#4B4032',
+}
 
 # Add any paths that contain custom themes here, relative to this directory.
-# html_theme_path = []
+html_theme_path = [alabaster.get_path()]
 
 # The name for this set of Sphinx documents.  If None, it defaults to
 # "<project> v<release> documentation".
@@ -141,7 +179,7 @@ html_theme = 'default'
 
 # The name of an image file (relative to this directory) to place at the top
 # of the sidebar.
-html_logo = 'aiohttp-icon.svg'
+# html_logo = 'aiohttp-icon.svg'
 
 # The name of an image file (within the static path) to use as favicon of the
 # docs.  This file should be a Windows icon file (.ico) being 16x16 or 32x32
@@ -167,7 +205,11 @@ html_static_path = ['_static']
 # html_use_smartypants = True
 
 # Custom sidebar templates, maps document names to template names.
-# html_sidebars = {}
+html_sidebars = {
+    '**': [
+        'about.html', 'navigation.html', 'searchbox.html',
+    ]
+}
 
 # Additional templates that should be rendered to pages, maps page names to
 # template names.
@@ -280,3 +322,6 @@ texinfo_documents = [
 
 # If true, do not generate a @detailmenu in the "Top" node's menu.
 # texinfo_no_detailmenu = False
+
+
+disqus_shortname = 'aiohttp'

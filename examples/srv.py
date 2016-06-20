@@ -10,8 +10,6 @@ try:
 except ImportError:  # pragma: no cover
     ssl = None
 
-assert sys.version >= '3.3', 'Please use Python 3.3 or higher.'
-
 import asyncio
 import aiohttp
 import aiohttp.server
@@ -38,15 +36,15 @@ class HttpRequestHandler(aiohttp.server.ServerHttpProtocol):
                 isdir = os.path.isdir(path)
 
         if not path:
-            raise aiohttp.HttpProcessingError(404)
+            raise aiohttp.HttpProcessingError(code=404)
 
-        for hdr, val in message.headers.items(getall=True):
+        for hdr, val in message.headers.items():
             print(hdr, val)
 
         if isdir and not path.endswith('/'):
             path = path + '/'
             raise aiohttp.HttpProcessingError(
-                302, headers=(('URI', path), ('Location', path)))
+                code=302, headers=(('URI', path), ('Location', path)))
 
         response = aiohttp.Response(
             self.writer, 200, http_version=message.version)
@@ -100,7 +98,7 @@ class HttpRequestHandler(aiohttp.server.ServerHttpProtocol):
             self.keep_alive(True)
 
 
-ARGS = argparse.ArgumentParser(description="Run simple http server.")
+ARGS = argparse.ArgumentParser(description="Run simple HTTP server.")
 ARGS.add_argument(
     '--host', action="store", dest='host',
     default='127.0.0.1', help='Host name')

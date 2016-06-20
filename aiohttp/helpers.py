@@ -1,16 +1,31 @@
 """Various helper functions"""
-__all__ = ['BasicAuth', 'FormData', 'parse_mimetype']
 
+import asyncio
 import base64
 import binascii
+import datetime
+import functools
 import io
 import os
-import uuid
-import urllib.parse
+import re
+from urllib.parse import quote, urlencode, urlsplit
+from http.cookies import SimpleCookie, Morsel
 from collections import namedtuple
-from wsgiref.handlers import format_date_time
+from pathlib import Path
 
-from . import multidict
+import multidict
+
+from . import hdrs
+from .errors import InvalidURL
+
+try:
+    from asyncio import ensure_future
+except ImportError:
+    ensure_future = asyncio.async
+
+
+__all__ = ('BasicAuth', 'create_future', 'FormData', 'parse_mimetype',
+           'Timeout')
 
 
 class BasicAuth(namedtuple('BasicAuth', ['login', 'password', 'encoding'])):
@@ -30,10 +45,40 @@ class BasicAuth(namedtuple('BasicAuth', ['login', 'password', 'encoding'])):
 
         return super().__new__(cls, login, password, encoding)
 
+    @classmethod
+    def decode(cls, auth_header, encoding='latin1'):
+        """Create a :class:`BasicAuth` object from an ``Authorization`` HTTP
+        header."""
+        split = auth_header.strip().split(' ')
+        if len(split) == 2:
+            if split[0].strip().lower() != 'basic':
+                raise ValueError('Unknown authorization method %s' % split[0])
+            to_decode = split[1]
+        else:
+            raise ValueError('Could not parse authorization header.')
+
+        try:
+            username, _, password = base64.b64decode(
+                to_decode.encode('ascii')
+            ).decode(encoding).partition(':')
+        except binascii.Error:
+            raise ValueError('Invalid base64 encoding.')
+
+        return cls(username, password, encoding=encoding)
+
     def encode(self):
         """Encode credentials."""
         creds = ('%s:%s' % (self.login, self.password)).encode(self.encoding)
         return 'Basic %s' % base64.b64encode(creds).decode(self.encoding)
+
+
+def create_future(loop):
+    """Compatiblity wrapper for the loop.create_future() call introduced in
+    3.5.2."""
+    if hasattr(loop, 'create_future'):
+        return loop.create_future()
+    else:
+        return asyncio.Future(loop=loop)
 
 
 class FormData:
@@ -41,9 +86,10 @@ class FormData:
     application/x-www-form-urlencoded body generation."""
 
     def __init__(self, fields=()):
+        from . import multipart
+        self._writer = multipart.MultipartWriter('form-data')
         self._fields = []
         self._is_multipart = False
-        self._boundary = uuid.uuid4().hex
 
         if isinstance(fields, dict):
             fields = list(fields.items())
@@ -58,7 +104,7 @@ class FormData:
     @property
     def content_type(self):
         if self._is_multipart:
-            return 'multipart/form-data; boundary=%s' % self._boundary
+            return self._writer.headers[hdrs.CONTENT_TYPE]
         else:
             return 'application/x-www-form-urlencoded'
 
@@ -67,8 +113,14 @@ class FormData:
 
         if isinstance(value, io.IOBase):
             self._is_multipart = True
+        elif isinstance(value, (bytes, bytearray, memoryview)):
+            if filename is None and content_transfer_encoding is None:
+                filename = name
 
-        type_options = multidict.MutableMultiDict({'name': name})
+        type_options = multidict.MultiDict({'name': name})
+        if filename is not None and not isinstance(filename, str):
+            raise TypeError('filename must be an instance of str. '
+                            'Got: %s' % filename)
         if filename is None and isinstance(value, io.IOBase):
             filename = guess_filename(value, name)
         if filename is not None:
@@ -77,18 +129,17 @@ class FormData:
 
         headers = {}
         if content_type is not None:
-            headers['Content-Type'] = content_type
+            if not isinstance(content_type, str):
+                raise TypeError('content_type must be an instance of str. '
+                                'Got: %s' % content_type)
+            headers[hdrs.CONTENT_TYPE] = content_type
             self._is_multipart = True
         if content_transfer_encoding is not None:
-            headers['Content-Transfer-Encoding'] = content_transfer_encoding
+            if not isinstance(content_transfer_encoding, str):
+                raise TypeError('content_transfer_encoding must be an instance'
+                                ' of str. Got: %s' % content_transfer_encoding)
+            headers[hdrs.CONTENT_TRANSFER_ENCODING] = content_transfer_encoding
             self._is_multipart = True
-            supported_tranfer_encoding = {
-                'base64': binascii.b2a_base64,
-                'quoted-printable': binascii.b2a_qp
-            }
-            conv = supported_tranfer_encoding.get(content_transfer_encoding)
-            if conv is not None:
-                value = conv(value)
 
         self._fields.append((type_options, headers, value))
 
@@ -102,8 +153,10 @@ class FormData:
                 k = guess_filename(rec, 'unknown')
                 self.add_field(k, rec)
 
-            elif isinstance(rec, multidict.MultiDict):
-                to_add.extend(rec.items(getall=True))
+            elif isinstance(rec,
+                            (multidict.MultiDictProxy,
+                             multidict.MultiDict)):
+                to_add.extend(rec.items())
 
             elif isinstance(rec, (list, tuple)) and len(rec) == 2:
                 k, fp = rec
@@ -117,50 +170,22 @@ class FormData:
     def _gen_form_urlencoded(self, encoding):
         # form data (x-www-form-urlencoded)
         data = []
-        for type_options, headers, value in self._fields:
+        for type_options, _, value in self._fields:
             data.append((type_options['name'], value))
 
-        data = urllib.parse.urlencode(data, doseq=True)
+        data = urlencode(data, doseq=True)
         return data.encode(encoding)
 
-    def _gen_form_data(self, encoding='utf-8', chunk_size=8192):
+    def _gen_form_data(self, *args, **kwargs):
         """Encode a list of fields using the multipart/form-data MIME format"""
-        boundary = self._boundary.encode('latin1')
-
-        for type_options, headers, value in self._fields:
-            yield b'--' + boundary + b'\r\n'
-
-            out_headers = []
-
-            opts = '; '.join('{0[0]}="{0[1]}"'.format(i)
-                             for i in type_options.items())
-
-            out_headers.append(
-                ('Content-Disposition: form-data; ' + opts).encode(encoding)
-                + b'\r\n')
-
-            for k, v in headers.items():
-                out_headers.append('{}: {}\r\n'.format(k, v).encode(encoding))
-
-            out_headers.append(b'\r\n')
-
-            yield b''.join(out_headers)
-
-            if isinstance(value, str):
-                yield value.encode(encoding)
-            else:
-                if isinstance(value, (bytes, bytearray)):
-                    value = io.BytesIO(value)
-
-                while True:
-                    chunk = value.read(chunk_size)
-                    if not chunk:
-                        break
-                    yield str_to_bytes(chunk, encoding)
-
-            yield b'\r\n'
-
-        yield b'--' + boundary + b'--\r\n'
+        for dispparams, headers, value in self._fields:
+            part = self._writer.append(value, headers)
+            if dispparams:
+                part.set_content_disposition('form-data', **dispparams)
+                # FIXME cgi.FieldStorage doesn't likes body parts with
+                # Content-Length which were sent via chunked transfer encoding
+                part.headers.pop(hdrs.CONTENT_LENGTH, None)
+        yield from self._writer.serialize()
 
     def __call__(self, encoding):
         if self._is_multipart:
@@ -215,117 +240,582 @@ def str_to_bytes(s, encoding='utf-8'):
 def guess_filename(obj, default=None):
     name = getattr(obj, 'name', None)
     if name and name[0] != '<' and name[-1] != '>':
-        return os.path.split(name)[-1]
+        return Path(name).name
     return default
 
 
-def parse_remote_addr(forward):
-    if isinstance(forward, str):
-        # we only took the last one
-        # http://en.wikipedia.org/wiki/X-Forwarded-For
-        if ',' in forward:
-            forward = forward.rsplit(',', 1)[-1].strip()
+class AccessLogger:
+    """Helper object to log access.
 
-        # find host and port on ipv6 address
-        if '[' in forward and ']' in forward:
-            host = forward.split(']')[0][1:].lower()
-        elif ':' in forward and forward.count(':') == 1:
-            host = forward.split(':')[0].lower()
-        else:
-            host = forward
+    Usage:
+        log = logging.getLogger("spam")
+        log_format = "%a %{User-Agent}i"
+        access_logger = AccessLogger(log, log_format)
+        access_logger.log(message, environ, response, transport, time)
 
-        forward = forward.split(']')[-1]
-        if ':' in forward and forward.count(':') == 1:
-            port = forward.split(':', 1)[1]
-        else:
-            port = 80
+    Format:
+        %%  The percent sign
+        %a  Remote IP-address (IP-address of proxy if using reverse proxy)
+        %t  Time when the request was started to process
+        %P  The process ID of the child that serviced the request
+        %r  First line of request
+        %s  Response status code
+        %b  Size of response in bytes, excluding HTTP headers
+        %O  Bytes sent, including headers
+        %T  Time taken to serve the request, in seconds
+        %Tf Time taken to serve the request, in seconds with floating fraction
+            in .06f format
+        %D  Time taken to serve the request, in microseconds
+        %{FOO}i  request.headers['FOO']
+        %{FOO}o  response.headers['FOO']
+        %{FOO}e  os.environ['FOO']
 
-        remote = (host, port)
-    else:
-        remote = forward
+    """
 
-    return remote[0], str(remote[1])
+    LOG_FORMAT = '%a %l %u %t "%r" %s %b "%{Referrer}i" "%{User-Agent}i"'
+    FORMAT_RE = re.compile(r'%(\{([A-Za-z\-]+)\}([ioe])|[atPrsbOD]|Tf?)')
+    CLEANUP_RE = re.compile(r'(%[^s])')
+    _FORMAT_CACHE = {}
 
+    def __init__(self, logger, log_format=LOG_FORMAT):
+        """Initialise the logger.
 
-def atoms(message, environ, response, transport, request_time):
-    """Gets atoms for log formatting."""
-    if message:
-        r = '{} {} HTTP/{}.{}'.format(
-            message.method, message.path,
-            message.version[0], message.version[1])
-        headers = message.headers
-    else:
-        r = ''
-        headers = {}
+        :param logger: logger object to be used for logging
+        :param log_format: apache compatible log format
 
-    remote_addr = parse_remote_addr(
-        transport.get_extra_info('addr', '127.0.0.1'))
+        """
+        self.logger = logger
+        _compiled_format = AccessLogger._FORMAT_CACHE.get(log_format)
+        if not _compiled_format:
+            _compiled_format = self.compile_format(log_format)
+            AccessLogger._FORMAT_CACHE[log_format] = _compiled_format
+        self._log_format, self._methods = _compiled_format
 
-    atoms = {
-        'h': remote_addr[0],
-        'l': '-',
-        'u': '-',
-        't': format_date_time(None),
-        'r': r,
-        's': str(getattr(response, 'status', '')),
-        'b': str(getattr(response, 'output_length', '')),
-        'f': headers.get('REFERER', '-'),
-        'a': headers.get('USER-AGENT', '-'),
-        'T': str(int(request_time)),
-        'D': str(request_time).split('.', 1)[-1][:5],
-        'p': "<%s>" % os.getpid()
-    }
+    def compile_format(self, log_format):
+        """Translate log_format into form usable by modulo formatting
 
-    return atoms
+        All known atoms will be replaced with %s
+        Also methods for formatting of those atoms will be added to
+        _methods in apropriate order
 
+        For example we have log_format = "%a %t"
+        This format will be translated to "%s %s"
+        Also contents of _methods will be
+        [self._format_a, self._format_t]
+        These method will be called and results will be passed
+        to translated string format.
 
-class SafeAtoms(dict):
-    """Copy from gunicorn"""
+        Each _format_* method receive 'args' which is list of arguments
+        given to self.log
 
-    def __init__(self, atoms, i_headers, o_headers):
-        dict.__init__(self)
+        Exceptions are _format_e, _format_i and _format_o methods which
+        also receive key name (by functools.partial)
 
-        self._i_headers = i_headers
-        self._o_headers = o_headers
+        """
 
-        for key, value in atoms.items():
-            self[key] = value.replace('"', '\\"')
+        log_format = log_format.replace("%l", "-")
+        log_format = log_format.replace("%u", "-")
+        methods = []
 
-    def __getitem__(self, k):
-        if k.startswith('{'):
-            if k.endswith('}i'):
-                headers = self._i_headers
-            elif k.endswith('}o'):
-                headers = self._o_headers
+        for atom in self.FORMAT_RE.findall(log_format):
+            if atom[1] == '':
+                methods.append(getattr(AccessLogger, '_format_%s' % atom[0]))
             else:
-                headers = None
+                m = getattr(AccessLogger, '_format_%s' % atom[2])
+                methods.append(functools.partial(m, atom[1]))
+        log_format = self.FORMAT_RE.sub(r'%s', log_format)
+        log_format = self.CLEANUP_RE.sub(r'%\1', log_format)
+        return log_format, methods
 
-            if headers is not None:
-                return headers.get(k[1:-2], '-')
+    @staticmethod
+    def _format_e(key, args):
+        return (args[1] or {}).get(multidict.upstr(key), '-')
 
-        if k in self:
-            return super(SafeAtoms, self).__getitem__(k)
-        else:
+    @staticmethod
+    def _format_i(key, args):
+        return args[0].headers.get(multidict.upstr(key), '-')
+
+    @staticmethod
+    def _format_o(key, args):
+        return args[2].headers.get(multidict.upstr(key), '-')
+
+    @staticmethod
+    def _format_a(args):
+        return args[3].get_extra_info('peername')[0] if args[3] is not None \
+            else '-'
+
+    @staticmethod
+    def _format_t(args):
+        return datetime.datetime.utcnow().strftime('[%d/%b/%Y:%H:%M:%S +0000]')
+
+    @staticmethod
+    def _format_P(args):
+        return "<%s>" % os.getpid()
+
+    @staticmethod
+    def _format_r(args):
+        msg = args[0]
+        if not msg:
             return '-'
+        return '%s %s HTTP/%s.%s' % tuple((msg.method,
+                                           msg.path) + msg.version)
+
+    @staticmethod
+    def _format_s(args):
+        return args[2].status
+
+    @staticmethod
+    def _format_b(args):
+        return args[2].body_length
+
+    @staticmethod
+    def _format_O(args):
+        return args[2].output_length
+
+    @staticmethod
+    def _format_T(args):
+        return round(args[4])
+
+    @staticmethod
+    def _format_Tf(args):
+        return '%06f' % args[4]
+
+    @staticmethod
+    def _format_D(args):
+        return round(args[4] * 1000000)
+
+    def _format_line(self, args):
+        return tuple(m(args) for m in self._methods)
+
+    def log(self, message, environ, response, transport, time):
+        """Log access.
+
+        :param message: Request object. May be None.
+        :param environ: Environment dict. May be None.
+        :param response: Response object.
+        :param transport: Tansport object. May be None
+        :param float time: Time taken to serve the request.
+        """
+        try:
+            self.logger.info(self._log_format % self._format_line(
+                [message, environ, response, transport, time]))
+        except Exception:
+            self.logger.exception("Error in logging")
 
 
-class reify(object):
-    """ Use as a class method decorator.  It operates almost exactly like the
-    Python ``@property`` decorator, but it puts the result of the method it
-    decorates into the instance dict after the first call, effectively
-    replacing the function it decorates with an instance variable.  It is, in
-    Python parlance, a non-data descriptor. """
+_marker = object()
+
+
+class reify:
+    """Use as a class method decorator.  It operates almost exactly like
+    the Python `@property` decorator, but it puts the result of the
+    method it decorates into the instance dict after the first call,
+    effectively replacing the function it decorates with an instance
+    variable.  It is, in Python parlance, a data descriptor.
+
+    """
 
     def __init__(self, wrapped):
         self.wrapped = wrapped
         try:
             self.__doc__ = wrapped.__doc__
         except:  # pragma: no cover
-            pass
+            self.__doc__ = ""
+        self.name = wrapped.__name__
 
-    def __get__(self, inst, objtype=None):
-        if inst is None:  # pragma: no cover
+    def __get__(self, inst, owner, _marker=_marker):
+        if inst is None:
             return self
+        val = inst.__dict__.get(self.name, _marker)
+        if val is not _marker:
+            return val
         val = self.wrapped(inst)
-        setattr(inst, self.wrapped.__name__, val)
+        inst.__dict__[self.name] = val
         return val
+
+    def __set__(self, inst, value):
+        raise AttributeError("reified property is read-only")
+
+
+# The unreserved URI characters (RFC 3986)
+UNRESERVED_SET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz" +
+    "0123456789-._~")
+
+
+def unquote_unreserved(uri):
+    """Un-escape any percent-escape sequences in a URI that are unreserved
+    characters. This leaves all reserved, illegal and non-ASCII bytes encoded.
+    """
+    parts = uri.split('%')
+    for i in range(1, len(parts)):
+        h = parts[i][0:2]
+        if len(h) == 2 and h.isalnum():
+            try:
+                c = chr(int(h, 16))
+            except ValueError:
+                raise InvalidURL("Invalid percent-escape sequence: '%s'" % h)
+
+            if c in UNRESERVED_SET:
+                parts[i] = c + parts[i][2:]
+            else:
+                parts[i] = '%' + parts[i]
+        else:
+            parts[i] = '%' + parts[i]
+    return ''.join(parts)
+
+
+def requote_uri(uri):
+    """Re-quote the given URI.
+
+    This function passes the given URI through an unquote/quote cycle to
+    ensure that it is fully and consistently quoted.
+    """
+    safe_with_percent = "!#$%&'()*+,/:;=?@[]~"
+    safe_without_percent = "!#$&'()*+,/:;=?@[]~"
+    try:
+        # Unquote only the unreserved characters
+        # Then quote only illegal characters (do not quote reserved,
+        # unreserved, or '%')
+        return quote(unquote_unreserved(uri), safe=safe_with_percent)
+    except InvalidURL:
+        # We couldn't unquote the given URI, so let's try quoting it, but
+        # there may be unquoted '%'s in the URI. We need to make sure they're
+        # properly quoted so they do not cause issues elsewhere.
+        return quote(uri, safe=safe_without_percent)
+
+
+_ipv4_pattern = ('^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}'
+                 '(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$')
+_ipv6_pattern = (
+    '^(?:(?:(?:[A-F0-9]{1,4}:){6}|(?=(?:[A-F0-9]{0,4}:){0,6}'
+    '(?:[0-9]{1,3}\.){3}[0-9]{1,3}$)(([0-9A-F]{1,4}:){0,5}|:)'
+    '((:[0-9A-F]{1,4}){1,5}:|:)|::(?:[A-F0-9]{1,4}:){5})'
+    '(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}'
+    '(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])|(?:[A-F0-9]{1,4}:){7}'
+    '[A-F0-9]{1,4}|(?=(?:[A-F0-9]{0,4}:){0,7}[A-F0-9]{0,4}$)'
+    '(([0-9A-F]{1,4}:){1,7}|:)((:[0-9A-F]{1,4}){1,7}|:)|(?:[A-F0-9]{1,4}:){7}'
+    ':|:(:[A-F0-9]{1,4}){7})$')
+_ipv4_regex = re.compile(_ipv4_pattern)
+_ipv6_regex = re.compile(_ipv6_pattern, flags=re.IGNORECASE)
+_ipv4_regexb = re.compile(_ipv4_pattern.encode('ascii'))
+_ipv6_regexb = re.compile(_ipv6_pattern.encode('ascii'), flags=re.IGNORECASE)
+
+
+def is_ip_address(host):
+    if host is None:
+        return False
+    if isinstance(host, str):
+        if _ipv4_regex.match(host) or _ipv6_regex.match(host):
+            return True
+        else:
+            return False
+    elif isinstance(host, (bytes, bytearray, memoryview)):
+        if _ipv4_regexb.match(host) or _ipv6_regexb.match(host):
+            return True
+        else:
+            return False
+    else:
+        raise TypeError("{} [{}] is not a str or bytes"
+                        .format(host, type(host)))
+
+
+class Timeout:
+    """Timeout context manager.
+
+    Useful in cases when you want to apply timeout logic around block
+    of code or in cases when asyncio.wait_for is not suitable. For example:
+
+    >>> with aiohttp.Timeout(0.001):
+    ...     async with aiohttp.get('https://github.com') as r:
+    ...         await r.text()
+
+
+    :param timeout: timeout value in seconds or None to disable timeout logic
+    :param loop: asyncio compatible event loop
+    """
+    def __init__(self, timeout, *, loop=None):
+        self._timeout = timeout
+        if loop is None:
+            loop = asyncio.get_event_loop()
+        self._loop = loop
+        self._task = None
+        self._cancelled = False
+        self._cancel_handler = None
+
+    def __enter__(self):
+        self._task = asyncio.Task.current_task(loop=self._loop)
+        if self._task is None:
+            raise RuntimeError('Timeout context manager should be used '
+                               'inside a task')
+        if self._timeout is not None:
+            self._cancel_handler = self._loop.call_later(
+                self._timeout, self._cancel_task)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is asyncio.CancelledError and self._cancelled:
+            self._cancel_handler = None
+            self._task = None
+            raise asyncio.TimeoutError
+        if self._timeout is not None:
+            self._cancel_handler.cancel()
+            self._cancel_handler = None
+        self._task = None
+
+    def _cancel_task(self):
+        self._cancelled = self._task.cancel()
+
+
+class CookieJar:
+    """Implements cookie storage adhering to RFC 6265."""
+
+    DATE_TOKENS_RE = re.compile(
+        "[\x09\x20-\x2F\x3B-\x40\x5B-\x60\x7B-\x7E]*"
+        "(?P<token>[\x00-\x08\x0A-\x1F\d:a-zA-Z\x7F-\xFF]+)")
+
+    DATE_HMS_TIME_RE = re.compile("(\d{1,2}):(\d{1,2}):(\d{1,2})")
+
+    DATE_DAY_OF_MONTH_RE = re.compile("(\d{1,2})")
+
+    DATE_MONTH_RE = re.compile(
+        "(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", re.I)
+
+    DATE_YEAR_RE = re.compile("(\d{2,4})")
+
+    def __init__(self, cookies=None, loop=None):
+        self._cookies = SimpleCookie()
+        self._loop = loop or asyncio.get_event_loop()
+        self._host_only_cookies = set()
+
+        if cookies is not None:
+            self.update_cookies(cookies)
+
+    @property
+    def cookies(self):
+        """The session cookies."""
+        return self._cookies
+
+    def _expire_cookie(self, name):
+        if name in self._cookies:
+            del self._cookies[name]
+
+    def update_cookies(self, cookies, response_url=None):
+        """Update cookies."""
+        url_parsed = urlsplit(response_url or "")
+        hostname = url_parsed.hostname
+
+        if is_ip_address(hostname):
+            # Don't accept cookies from IPs
+            return
+
+        if isinstance(cookies, dict):
+            cookies = cookies.items()
+
+        for name, value in cookies:
+            if isinstance(value, Morsel):
+
+                if not self._add_morsel(name, value, hostname):
+                    continue
+
+            else:
+                self._cookies[name] = value
+
+            cookie = self._cookies[name]
+
+            if not cookie["domain"] and hostname is not None:
+                # Set the cookie's domain to the response hostname
+                # and set its host-only-flag
+                self._host_only_cookies.add(name)
+                cookie["domain"] = hostname
+
+            if not cookie["path"] or not cookie["path"].startswith("/"):
+                # Set the cookie's path to the response path
+                path = url_parsed.path
+                if not path.startswith("/"):
+                    path = "/"
+                else:
+                    # Cut everything from the last slash to the end
+                    path = "/" + path[1:path.rfind("/")]
+                cookie["path"] = path
+
+            max_age = cookie["max-age"]
+            if max_age:
+                try:
+                    delta_seconds = int(max_age)
+                    self._loop.call_later(
+                        delta_seconds, self._expire_cookie, name)
+                except ValueError:
+                    cookie["max-age"] = ""
+
+            expires = cookie["expires"]
+            if not cookie["max-age"] and expires:
+                expire_time = self._parse_date(expires)
+                if expire_time:
+                    self._loop.call_at(
+                        expire_time.timestamp(),
+                        self._expire_cookie, name)
+                else:
+                    cookie["expires"] = ""
+
+        # Remove the host-only flags of nonexistent cookies
+        self._host_only_cookies -= (
+            self._host_only_cookies.difference(self._cookies.keys()))
+
+    def _add_morsel(self, name, value, hostname):
+        """Add a Morsel to the cookie jar."""
+        cookie_domain = value["domain"]
+        if cookie_domain.startswith("."):
+            # Remove leading dot
+            cookie_domain = cookie_domain[1:]
+            value["domain"] = cookie_domain
+
+        if not cookie_domain or not hostname:
+            dict.__setitem__(self._cookies, name, value)
+            return True
+
+        if not self._is_domain_match(cookie_domain, hostname):
+            # Setting cookies for different domains is not allowed
+            return False
+
+        # use dict method because SimpleCookie class modifies value
+        # before Python 3.4
+        dict.__setitem__(self._cookies, name, value)
+        return True
+
+    def filter_cookies(self, request_url):
+        """Returns this jar's cookies filtered by their attributes."""
+        url_parsed = urlsplit(request_url)
+        filtered = SimpleCookie()
+
+        for name, cookie in self._cookies.items():
+            cookie_domain = cookie["domain"]
+
+            # Send shared cookies
+            if not cookie_domain:
+                dict.__setitem__(filtered, name, cookie)
+                continue
+
+            hostname = url_parsed.hostname or ""
+
+            if is_ip_address(hostname):
+                continue
+
+            if name in self._host_only_cookies:
+                if cookie_domain != hostname:
+                    continue
+            elif not self._is_domain_match(cookie_domain, hostname):
+                continue
+
+            if not self._is_path_match(url_parsed.path, cookie["path"]):
+                continue
+
+            is_secure = url_parsed.scheme in ("https", "wss")
+
+            if cookie["secure"] and not is_secure:
+                continue
+
+            dict.__setitem__(filtered, name, cookie)
+
+        return filtered
+
+    @staticmethod
+    def _is_domain_match(domain, hostname):
+        """Implements domain matching adhering to RFC 6265."""
+        if hostname == domain:
+            return True
+
+        if not hostname.endswith(domain):
+            return False
+
+        non_matching = hostname[:-len(domain)]
+
+        if not non_matching.endswith("."):
+            return False
+
+        return not is_ip_address(hostname)
+
+    @staticmethod
+    def _is_path_match(req_path, cookie_path):
+        """Implements path matching adhering to RFC 6265."""
+        if req_path == cookie_path:
+            return True
+
+        if not req_path.startswith(cookie_path):
+            return False
+
+        if cookie_path.endswith("/"):
+            return True
+
+        non_matching = req_path[len(cookie_path):]
+
+        return non_matching.startswith("/")
+
+    @classmethod
+    def _parse_date(cls, date_str):
+        """Implements date string parsing adhering to RFC 6265."""
+        if not date_str:
+            return
+
+        found_time = False
+        found_day_of_month = False
+        found_month = False
+        found_year = False
+
+        hour = minute = second = 0
+        day_of_month = 0
+        month = ""
+        year = 0
+
+        for token_match in cls.DATE_TOKENS_RE.finditer(date_str):
+
+            token = token_match.group("token")
+
+            if not found_time:
+                time_match = cls.DATE_HMS_TIME_RE.match(token)
+                if time_match:
+                    found_time = True
+                    hour, minute, second = [
+                        int(s) for s in time_match.groups()]
+                    continue
+
+            if not found_day_of_month:
+                day_of_month_match = cls.DATE_DAY_OF_MONTH_RE.match(token)
+                if day_of_month_match:
+                    found_day_of_month = True
+                    day_of_month = int(day_of_month_match.group())
+                    continue
+
+            if not found_month:
+                month_match = cls.DATE_MONTH_RE.match(token)
+                if month_match:
+                    found_month = True
+                    month = month_match.group()
+                    continue
+
+            if not found_year:
+                year_match = cls.DATE_YEAR_RE.match(token)
+                if year_match:
+                    found_year = True
+                    year = int(year_match.group())
+
+        if 70 <= year <= 99:
+            year += 1900
+        elif 0 <= year <= 69:
+            year += 2000
+
+        if False in (found_day_of_month, found_month, found_year, found_time):
+            return
+
+        if not 1 <= day_of_month <= 31:
+            return
+
+        if year < 1601 or hour > 23 or minute > 59 or second > 59:
+            return
+
+        dt = datetime.datetime.strptime(
+            "%s %d %d:%d:%d %d" % (
+                month, day_of_month, hour, minute, second, year
+            ), "%b %d %H:%M:%S %Y")
+
+        return dt.replace(tzinfo=datetime.timezone.utc)

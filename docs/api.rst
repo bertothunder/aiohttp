@@ -1,26 +1,13 @@
-aiohttp package
-===============
+.. _aiohttp-api:
 
-All public names from submodules ``client``, ``connector``,
-``errors``, ``parsers``, ``protocol``, ``server``, ``utils``,
+Helpers API
+===========
+
+All public names from submodules
+``errors``, ``multipart``, ``parsers``, ``protocol``, ``utils``,
 ``websocket`` and ``wsgi`` are exported into ``aiohttp``
 namespace.
 
-aiohttp.client module
----------------------
-
-.. automodule:: aiohttp.client
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
-aiohttp.connector module
-------------------------
-
-.. automodule:: aiohttp.connector
-    :members:
-    :undoc-members:
-    :show-inheritance:
 
 aiohttp.errors module
 ---------------------
@@ -36,6 +23,15 @@ aiohttp.helpers module
 .. automodule:: aiohttp.helpers
     :members:
     :undoc-members:
+    :exclude-members: BasicAuth
+    :show-inheritance:
+
+aiohttp.multipart module
+------------------------
+
+.. automodule:: aiohttp.multipart
+    :members:
+    :undoc-members:
     :show-inheritance:
 
 aiohttp.parsers module
@@ -46,18 +42,10 @@ aiohttp.parsers module
     :undoc-members:
     :show-inheritance:
 
-aiohttp.protocol module
------------------------
+aiohttp.signals module
+----------------------
 
-.. automodule:: aiohttp.protocol
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
-aiohttp.server module
----------------------
-
-.. automodule:: aiohttp.server
+.. automodule:: aiohttp.signals
     :members:
     :undoc-members:
     :show-inheritance:
@@ -69,6 +57,7 @@ aiohttp.streams module
     :members:
     :undoc-members:
     :show-inheritance:
+
 
 aiohttp.websocket module
 ------------------------
@@ -85,3 +74,6 @@ aiohttp.wsgi module
     :members:
     :undoc-members:
     :show-inheritance:
+
+
+.. disqus::

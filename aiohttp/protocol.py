@@ -1,33 +1,34 @@
 """Http related parsers and protocol."""
 
-__all__ = ['HttpMessage', 'Request', 'Response',
-           'HttpVersion', 'HttpVersion10', 'HttpVersion11',
-           'RawRequestMessage', 'RawResponseMessage',
-           'HttpPrefixParser', 'HttpRequestParser', 'HttpResponseParser',
-           'HttpPayloadParser']
-
 import collections
 import functools
 import http.server
-import itertools
 import re
 import string
 import sys
 import zlib
+from abc import abstractmethod, ABC
 from wsgiref.handlers import format_date_time
+from multidict import CIMultiDict, upstr
 
 import aiohttp
-from aiohttp import errors
-from aiohttp import multidict
-from aiohttp.log import internal_logger
+from . import errors, hdrs
+from .log import internal_logger
+from .helpers import reify
+
+__all__ = ('HttpMessage', 'Request', 'Response',
+           'HttpVersion', 'HttpVersion10', 'HttpVersion11',
+           'RawRequestMessage', 'RawResponseMessage',
+           'HttpPrefixParser', 'HttpRequestParser', 'HttpResponseParser',
+           'HttpPayloadParser')
 
 ASCIISET = set(string.printable)
 METHRE = re.compile('[A-Z0-9$-_.]+')
 VERSRE = re.compile('HTTP/(\d+).(\d+)')
-HDRRE = re.compile('[\x00-\x1F\x7F()<>@,;:\[\]={} \t\\\\\"]')
-CONTINUATION = (' ', '\t')
+HDRRE = re.compile(b'[\x00-\x1F\x7F()<>@,;:\[\]={} \t\\\\\"]')
 EOF_MARKER = object()
 EOL_MARKER = object()
+STATUS_LINE_READY = object()
 
 RESPONSES = http.server.BaseHTTPRequestHandler.responses
 
@@ -36,15 +37,19 @@ HttpVersion = collections.namedtuple(
 HttpVersion10 = HttpVersion(1, 0)
 HttpVersion11 = HttpVersion(1, 1)
 
+RawStatusLineMessage = collections.namedtuple(
+    'RawStatusLineMessage', ['method', 'path', 'version'])
 
 RawRequestMessage = collections.namedtuple(
     'RawRequestMessage',
-    ['method', 'path', 'version', 'headers', 'should_close', 'compression'])
+    ['method', 'path', 'version', 'headers', 'raw_headers',
+     'should_close', 'compression'])
 
 
 RawResponseMessage = collections.namedtuple(
     'RawResponseMessage',
-    ['version', 'code', 'reason', 'headers', 'should_close', 'compression'])
+    ['version', 'code', 'reason', 'headers', 'raw_headers',
+     'should_close', 'compression'])
 
 
 class HttpParser:
@@ -56,14 +61,15 @@ class HttpParser:
         self.max_field_size = max_field_size
 
     def parse_headers(self, lines):
-        """Parses RFC2822 headers from a stream.
+        """Parses RFC 5322 headers from a stream.
 
         Line continuations are supported. Returns list of header name
         and value pairs. Header name is in upper case.
         """
         close_conn = None
         encoding = None
-        headers = []
+        headers = CIMultiDict()
+        raw_headers = []
 
         lines_idx = 1
         line = lines[1]
@@ -73,57 +79,61 @@ class HttpParser:
 
             # Parse initial header name : value pair.
             try:
-                name, value = line.split(':', 1)
+                bname, bvalue = line.split(b':', 1)
             except ValueError:
                 raise errors.InvalidHeader(line) from None
 
-            name = name.strip(' \t').upper()
-            if HDRRE.search(name):
-                raise errors.InvalidHeader(name)
+            bname = bname.strip(b' \t').upper()
+            if HDRRE.search(bname):
+                raise errors.InvalidHeader(bname)
 
             # next line
             lines_idx += 1
             line = lines[lines_idx]
 
             # consume continuation lines
-            continuation = line and line[0] in CONTINUATION
+            continuation = line and line[0] in (32, 9)  # (' ', '\t')
 
             if continuation:
-                value = [value]
+                bvalue = [bvalue]
                 while continuation:
                     header_length += len(line)
                     if header_length > self.max_field_size:
                         raise errors.LineTooLong(
                             'limit request headers fields size')
-                    value.append(line)
+                    bvalue.append(line)
 
                     # next line
                     lines_idx += 1
                     line = lines[lines_idx]
-                    continuation = line[0] in CONTINUATION
-                value = '\r\n'.join(value)
+                    continuation = line[0] in (32, 9)  # (' ', '\t')
+                bvalue = b'\r\n'.join(bvalue)
             else:
                 if header_length > self.max_field_size:
                     raise errors.LineTooLong(
                         'limit request headers fields size')
 
-            value = value.strip()
+            bvalue = bvalue.strip()
+
+            name = bname.decode('utf-8', 'surrogateescape')
+            value = bvalue.decode('utf-8', 'surrogateescape')
 
             # keep-alive and encoding
-            if name == 'CONNECTION':
+            if name == hdrs.CONNECTION:
                 v = value.lower()
                 if v == 'close':
                     close_conn = True
                 elif v == 'keep-alive':
                     close_conn = False
-            elif name == 'CONTENT-ENCODING':
+            elif name == hdrs.CONTENT_ENCODING:
                 enc = value.lower()
                 if enc in ('gzip', 'deflate'):
                     encoding = enc
 
-            headers.append((name, value))
+            headers.add(name, value)
+            raw_headers.append((bname, bvalue))
 
-        return multidict.MultiDict(headers), close_conn, encoding
+        return headers, raw_headers, close_conn, encoding
 
 
 class HttpPrefixParser:
@@ -133,7 +143,7 @@ class HttpPrefixParser:
         self.allowed_methods = [m.upper() for m in allowed_methods]
 
     def __call__(self, out, buf):
-        raw_data = yield from buf.waituntil(b' ', 24)
+        raw_data = yield from buf.waituntil(b' ', 12)
         method = raw_data.decode('ascii', 'surrogateescape').strip()
 
         # method
@@ -145,7 +155,7 @@ class HttpPrefixParser:
         if self.allowed_methods and method not in self.allowed_methods:
             raise errors.HttpMethodNotAllowed(message=method)
 
-        out.feed_data(method)
+        out.feed_data(method, len(method))
         out.feed_eof()
 
 
@@ -156,18 +166,17 @@ class HttpRequestParser(HttpParser):
     """
 
     def __call__(self, out, buf):
-        # read http message (request line + headers)
+        # read HTTP message (request line + headers)
         try:
             raw_data = yield from buf.readuntil(
                 b'\r\n\r\n', self.max_headers)
         except errors.LineLimitExceededParserError as exc:
             raise errors.LineTooLong(exc.limit) from None
 
-        lines = raw_data.decode(
-            'ascii', 'surrogateescape').split('\r\n')
+        lines = raw_data.split(b'\r\n')
 
         # request line
-        line = lines[0]
+        line = lines[0].decode('utf-8', 'surrogateescape')
         try:
             method, path, version = line.split(None, 2)
         except ValueError:
@@ -179,21 +188,28 @@ class HttpRequestParser(HttpParser):
             raise errors.BadStatusLine(method)
 
         # version
-        match = VERSRE.match(version)
-        if match is None:
+        try:
+            if version.startswith('HTTP/'):
+                n1, n2 = version[5:].split('.', 1)
+                version = HttpVersion(int(n1), int(n2))
+            else:
+                raise errors.BadStatusLine(version)
+        except:
             raise errors.BadStatusLine(version)
-        version = HttpVersion(int(match.group(1)), int(match.group(2)))
 
         # read headers
-        headers, close, compression = self.parse_headers(lines)
-        if version <= HttpVersion10:
-            close = True
-        elif close is None:
-            close = False
+        headers, raw_headers, close, compression = self.parse_headers(lines)
+        if close is None:  # then the headers weren't set in the request
+            if version <= HttpVersion10:  # HTTP 1.0 must asks to not close
+                close = True
+            else:  # HTTP 1.1 must ask to close.
+                close = False
 
         out.feed_data(
             RawRequestMessage(
-                method, path, version, headers, close, compression))
+                method, path, version, headers, raw_headers,
+                close, compression),
+            len(raw_data))
         out.feed_eof()
 
 
@@ -204,17 +220,16 @@ class HttpResponseParser(HttpParser):
     Returns RawResponseMessage"""
 
     def __call__(self, out, buf):
-        # read http message (response line + headers)
+        # read HTTP message (response line + headers)
         try:
             raw_data = yield from buf.readuntil(
                 b'\r\n\r\n', self.max_line_size + self.max_headers)
         except errors.LineLimitExceededParserError as exc:
             raise errors.LineTooLong(exc.limit) from None
 
-        lines = raw_data.decode(
-            'ascii', 'surrogateescape').split('\r\n')
+        lines = raw_data.split(b'\r\n')
 
-        line = lines[0]
+        line = lines[0].decode('utf-8', 'surrogateescape')
         try:
             version, status = line.split(None, 1)
         except ValueError:
@@ -241,7 +256,7 @@ class HttpResponseParser(HttpParser):
             raise errors.BadStatusLine(line)
 
         # read headers
-        headers, close, compression = self.parse_headers(lines)
+        headers, raw_headers, close, compression = self.parse_headers(lines)
 
         if close is None:
             close = version <= HttpVersion10
@@ -249,7 +264,8 @@ class HttpResponseParser(HttpParser):
         out.feed_data(
             RawResponseMessage(
                 version, status, reason.strip(),
-                headers, close, compression))
+                headers, raw_headers, close, compression),
+            len(raw_data))
         out.feed_eof()
 
 
@@ -265,12 +281,13 @@ class HttpPayloadParser:
 
     def __call__(self, out, buf):
         # payload params
-        length = self.message.headers.get('CONTENT-LENGTH', self.length)
-        if 'SEC-WEBSOCKET-KEY1' in self.message.headers:
+        length = self.message.headers.get(hdrs.CONTENT_LENGTH, self.length)
+        if hdrs.SEC_WEBSOCKET_KEY1 in self.message.headers:
             length = 8
 
         # payload decompression wrapper
-        if self.compression and self.message.compression:
+        if (self.response_with_body and
+                self.compression and self.message.compression):
             out = DeflateBuffer(out, self.message.compression)
 
         # payload parser
@@ -278,17 +295,18 @@ class HttpPayloadParser:
             # don't parse payload if it's not expected to be received
             pass
 
-        elif 'chunked' in self.message.headers.get('TRANSFER-ENCODING', ''):
+        elif 'chunked' in self.message.headers.get(
+                hdrs.TRANSFER_ENCODING, ''):
             yield from self.parse_chunked_payload(out, buf)
 
         elif length is not None:
             try:
                 length = int(length)
             except ValueError:
-                raise errors.InvalidHeader('CONTENT-LENGTH') from None
+                raise errors.InvalidHeader(hdrs.CONTENT_LENGTH) from None
 
             if length < 0:
-                raise errors.InvalidHeader('CONTENT-LENGTH')
+                raise errors.InvalidHeader(hdrs.CONTENT_LENGTH)
             elif length > 0:
                 yield from self.parse_length_payload(out, buf, length)
         else:
@@ -322,7 +340,7 @@ class HttpPayloadParser:
             # read chunk and feed buffer
             while size:
                 chunk = yield from buf.readsome(size)
-                out.feed_data(chunk)
+                out.feed_data(chunk, len(chunk))
                 size = size - len(chunk)
 
             # toss the CRLF at the end of the chunk
@@ -336,14 +354,15 @@ class HttpPayloadParser:
         required = length
         while required:
             chunk = yield from buf.readsome(required)
-            out.feed_data(chunk)
+            out.feed_data(chunk, len(chunk))
             required -= len(chunk)
 
     def parse_eof_payload(self, out, buf):
         """Read all bytes until eof."""
         try:
             while True:
-                out.feed_data((yield from buf.readsome()))
+                chunk = yield from buf.readsome()
+                out.feed_data(chunk, len(chunk))
         except aiohttp.EofStream:
             pass
 
@@ -358,17 +377,18 @@ class DeflateBuffer:
 
         self.zlib = zlib.decompressobj(wbits=zlib_mode)
 
-    def feed_data(self, chunk):
+    def feed_data(self, chunk, size):
         try:
             chunk = self.zlib.decompress(chunk)
         except Exception:
             raise errors.ContentEncodingError('deflate')
 
         if chunk:
-            self.out.feed_data(chunk)
+            self.out.feed_data(chunk, len(chunk))
 
     def feed_eof(self):
-        self.out.feed_data(self.zlib.flush())
+        chunk = self.zlib.flush()
+        self.out.feed_data(chunk, len(chunk))
         if not self.zlib.eof:
             raise errors.ContentEncodingError('deflate')
 
@@ -423,7 +443,8 @@ def wrap_payload_filter(func):
     return wrapper
 
 
-def filter_pipe(filter, filter2):
+def filter_pipe(filter, filter2, *,
+                EOF_MARKER=EOF_MARKER, EOL_MARKER=EOL_MARKER):
     """Creates pipe between two filters.
 
     filter_pipe() feeds first filter with incoming data and then
@@ -461,7 +482,7 @@ def filter_pipe(filter, filter2):
         chunk = yield EOL_MARKER
 
 
-class HttpMessage:
+class HttpMessage(ABC):
     """HttpMessage allows to write headers and payload to a stream.
 
     For example, lets say we want to read file then compress it with deflate
@@ -512,45 +533,63 @@ class HttpMessage:
     SERVER_SOFTWARE = 'Python/{0[0]}.{0[1]} aiohttp/{1}'.format(
         sys.version_info, aiohttp.__version__)
 
-    status = None
-    status_line = b''
     upgrade = False  # Connection: UPGRADE
     websocket = False  # Upgrade: WEBSOCKET
+    has_chunked_hdr = False  # Transfer-encoding: chunked
 
     # subclass can enable auto sending headers with write() call,
     # this is useful for wsgi's start_response implementation.
     _send_headers = False
 
-    _has_user_agent = False
-
     def __init__(self, transport, version, close):
         self.transport = transport
-        self.version = version
+        self._version = version
         self.closing = close
-
-        # disable keep-alive for http/1.0
-        if version <= HttpVersion10:
-            self.keepalive = False
-        else:
-            self.keepalive = None
-
+        self.keepalive = None
         self.chunked = False
         self.length = None
-        self.headers = multidict.CaseInsensitiveMutableMultiDict()
+        self.headers = CIMultiDict()
         self.headers_sent = False
         self.output_length = 0
+        self.headers_length = 0
         self._output_size = 0
+
+    @property
+    @abstractmethod
+    def status_line(self):
+        return b''
+
+    @abstractmethod
+    def autochunked(self):
+        return False
+
+    @property
+    def version(self):
+        return self._version
+
+    @property
+    def body_length(self):
+        return self.output_length - self.headers_length
 
     def force_close(self):
         self.closing = True
         self.keepalive = False
 
-    def force_chunked(self):
+    def enable_chunked_encoding(self):
         self.chunked = True
 
     def keep_alive(self):
         if self.keepalive is None:
-            return not self.closing
+            if self.version < HttpVersion10:
+                # keep alive not supported at all
+                return False
+            if self.version == HttpVersion10:
+                if self.headers.get(hdrs.CONNECTION) == 'keep-alive':
+                    return True
+                else:  # no headers means we close for Http 1.0
+                    return False
+            else:
+                return not self.closing
         else:
             return self.keepalive
 
@@ -569,13 +608,16 @@ class HttpMessage:
             'Header {!r} should have string value, got {!r}'.format(
                 name, value)
 
-        name = name.strip().upper()
+        name = upstr(name)
         value = value.strip()
 
-        if name == 'CONTENT-LENGTH':
+        if name == hdrs.CONTENT_LENGTH:
             self.length = int(value)
 
-        if name == 'CONNECTION':
+        if name == hdrs.TRANSFER_ENCODING:
+            self.has_chunked_hdr = value.lower().strip() == 'chunked'
+
+        if name == hdrs.CONNECTION:
             val = value.lower()
             # handle websocket
             if 'upgrade' in val:
@@ -583,30 +625,24 @@ class HttpMessage:
             # connection keep-alive
             elif 'close' in val:
                 self.keepalive = False
-            elif 'keep-alive' in val and self.version >= HttpVersion11:
+            elif 'keep-alive' in val:
                 self.keepalive = True
 
-        elif name == 'UPGRADE':
+        elif name == hdrs.UPGRADE:
             if 'websocket' in value.lower():
                 self.websocket = True
                 self.headers[name] = value
 
-        elif name == 'TRANSFER-ENCODING' and not self.chunked:
-            self.chunked = value.lower().strip() == 'chunked'
-
         elif name not in self.HOP_HEADERS:
-            if name == 'USER-AGENT':
-                self._has_user_agent = True
-
             # ignore hop-by-hop headers
             self.headers.add(name, value)
 
     def add_headers(self, *headers):
-        """Adds headers to a http message."""
+        """Adds headers to a HTTP message."""
         for name, value in headers:
             self.add_header(name, value)
 
-    def send_headers(self):
+    def send_headers(self, _sep=': ', _end='\r\n'):
         """Writes headers to a stream. Constructs payload writer."""
         # Chunked response is only for HTTP/1.1 clients or newer
         # and there is no Content-Length header is set.
@@ -615,12 +651,9 @@ class HttpMessage:
         assert not self.headers_sent, 'headers have been sent already'
         self.headers_sent = True
 
-        if (self.chunked is True) or (
-                self.length is None and
-                self.version >= HttpVersion11 and
-                self.status not in (304, 204)):
-            self.chunked = True
+        if self.chunked or self.autochunked():
             self.writer = self._write_chunked_payload()
+            self.headers[hdrs.TRANSFER_ENCODING] = 'chunked'
 
         elif self.length is not None:
             self.writer = self._write_length_payload(self.length)
@@ -633,31 +666,31 @@ class HttpMessage:
         self._add_default_headers()
 
         # status + headers
-        hdrs = ''.join(itertools.chain(
-            (self.status_line,),
-            *((k, ': ', v, '\r\n')
-              for k, v in ((k, value)
-                           for k, value in self.headers.items(getall=True)))))
-        hdrs = hdrs.encode('utf-8') + b'\r\n'
+        headers = self.status_line + ''.join(
+            [k + _sep + v + _end for k, v in self.headers.items()])
+        headers = headers.encode('utf-8') + b'\r\n'
 
-        self.output_length += len(hdrs)
-        self.transport.write(hdrs)
+        self.output_length += len(headers)
+        self.headers_length = len(headers)
+        self.transport.write(headers)
 
     def _add_default_headers(self):
         # set the connection header
+        connection = None
         if self.upgrade:
             connection = 'upgrade'
         elif not self.closing if self.keepalive is None else self.keepalive:
-            connection = 'keep-alive'
+            if self.version == HttpVersion10:
+                connection = 'keep-alive'
         else:
-            connection = 'close'
+            if self.version == HttpVersion11:
+                connection = 'close'
 
-        if self.chunked:
-            self.headers['TRANSFER-ENCODING'] = 'chunked'
+        if connection is not None:
+            self.headers[hdrs.CONNECTION] = connection
 
-        self.headers['CONNECTION'] = connection
-
-    def write(self, chunk):
+    def write(self, chunk, *,
+              drain=False, EOF_MARKER=EOF_MARKER, EOL_MARKER=EOL_MARKER):
         """Writes chunk of data to a stream by using different writers.
 
         writer uses filter to modify chunk of data.
@@ -678,7 +711,8 @@ class HttpMessage:
         if self.filter:
             chunk = self.filter.send(chunk)
             while chunk not in (EOF_MARKER, EOL_MARKER):
-                self.writer.send(chunk)
+                if chunk:
+                    self.writer.send(chunk)
                 chunk = next(self.filter)
         else:
             if chunk is not EOF_MARKER:
@@ -687,10 +721,11 @@ class HttpMessage:
         self._output_size += self.output_length - size
 
         if self._output_size > 64 * 1024:
-            self._output_size = 0
-            return self.transport.drain()
-        else:
-            return ()
+            if drain:
+                self._output_size = 0
+                return self.transport.drain()
+
+        return ()
 
     def write_eof(self):
         self.write(EOF_MARKER)
@@ -713,9 +748,7 @@ class HttpMessage:
 
             chunk = bytes(chunk)
             chunk_len = '{:x}\r\n'.format(len(chunk)).encode('ascii')
-            self.transport.write(chunk_len)
-            self.transport.write(chunk)
-            self.transport.write(b'\r\n')
+            self.transport.write(chunk_len + chunk + b'\r\n')
             self.output_length += len(chunk_len) + len(chunk) + 2
 
     def _write_length_payload(self, length):
@@ -730,12 +763,12 @@ class HttpMessage:
                 l = len(chunk)
                 if length >= l:
                     self.transport.write(chunk)
-                    self.output_length += len(chunk)
+                    self.output_length += l
+                    length = length-l
                 else:
                     self.transport.write(chunk[:length])
                     self.output_length += length
-
-                length = max(0, length-l)
+                    length = 0
 
     def _write_eof_payload(self):
         while True:
@@ -748,7 +781,8 @@ class HttpMessage:
             self.output_length += len(chunk)
 
     @wrap_payload_filter
-    def add_chunking_filter(self, chunk_size=16*1024):
+    def add_chunking_filter(self, chunk_size=16*1024, *,
+                            EOF_MARKER=EOF_MARKER, EOL_MARKER=EOL_MARKER):
         """Split incoming stream into chunks."""
         buf = bytearray()
         chunk = yield
@@ -771,7 +805,8 @@ class HttpMessage:
                 chunk = yield EOL_MARKER
 
     @wrap_payload_filter
-    def add_compression_filter(self, encoding='deflate'):
+    def add_compression_filter(self, encoding='deflate', *,
+                               EOF_MARKER=EOF_MARKER, EOL_MARKER=EOL_MARKER):
         """Compress incoming stream with deflate or gzip encoding."""
         zlib_mode = (16 + zlib.MAX_WBITS
                      if encoding == 'gzip' else -zlib.MAX_WBITS)
@@ -789,29 +824,18 @@ class HttpMessage:
 
 
 class Response(HttpMessage):
-    """Create http response message.
+    """Create HTTP response message.
 
     Transport is a socket stream transport. status is a response status code,
     status has to be integer value. http_version is a tuple that represents
-    http version, (1, 0) stands for HTTP/1.0 and (1, 1) is for HTTP/1.1
+    HTTP version, (1, 0) stands for HTTP/1.0 and (1, 1) is for HTTP/1.1
     """
 
-    HOP_HEADERS = {
-        'CONNECTION',
-        'KEEP-ALIVE',
-        'PROXY-AUTHENTICATE',
-        'PROXY-AUTHORIZATION',
-        'TE',
-        'TRAILERS',
-        'TRANSFER-ENCODING',
-        'UPGRADE',
-        'SERVER',
-        'DATE',
-    }
+    HOP_HEADERS = ()
 
     @staticmethod
-    def calc_reason(status):
-        record = RESPONSES.get(status)
+    def calc_reason(status, *, _RESPONSES=RESPONSES):
+        record = _RESPONSES.get(status)
         if record is not None:
             reason = record[0]
         else:
@@ -822,19 +846,37 @@ class Response(HttpMessage):
                  http_version=HttpVersion11, close=False, reason=None):
         super().__init__(transport, http_version, close)
 
-        self.status = status
+        self._status = status
         if reason is None:
             reason = self.calc_reason(status)
 
-        self.reason = reason
-        self.status_line = 'HTTP/{}.{} {} {}\r\n'.format(
-            http_version[0], http_version[1], status, reason)
+        self._reason = reason
+
+    @property
+    def status(self):
+        return self._status
+
+    @property
+    def reason(self):
+        return self._reason
+
+    @reify
+    def status_line(self):
+        version = self.version
+        return 'HTTP/{}.{} {} {}\r\n'.format(
+            version[0], version[1], self.status, self.reason)
+
+    def autochunked(self):
+        return (self.length is None and
+                self.version >= HttpVersion11)
 
     def _add_default_headers(self):
         super()._add_default_headers()
 
-        self.headers.extend((('DATE', format_date_time(None)),
-                             ('SERVER', self.SERVER_SOFTWARE),))
+        if hdrs.DATE not in self.headers:
+            # format_date_time(None) is quite expensive
+            self.headers.setdefault(hdrs.DATE, format_date_time(None))
+        self.headers.setdefault(hdrs.SERVER, self.SERVER_SOFTWARE)
 
 
 class Request(HttpMessage):
@@ -843,15 +885,30 @@ class Request(HttpMessage):
 
     def __init__(self, transport, method, path,
                  http_version=HttpVersion11, close=False):
+        # set the default for HTTP 0.9 to be different
+        # will only be overwritten with keep-alive header
+        if http_version < HttpVersion10:
+            close = True
+
         super().__init__(transport, http_version, close)
 
-        self.method = method
-        self.path = path
-        self.status_line = '{0} {1} HTTP/{2[0]}.{2[1]}\r\n'.format(
-            method, path, http_version)
+        self._method = method
+        self._path = path
 
-    def _add_default_headers(self):
-        super()._add_default_headers()
+    @property
+    def method(self):
+        return self._method
 
-        if not self._has_user_agent:
-            self.headers['USER-AGENT'] = self.SERVER_SOFTWARE
+    @property
+    def path(self):
+        return self._path
+
+    @reify
+    def status_line(self):
+        return '{0} {1} HTTP/{2[0]}.{2[1]}\r\n'.format(
+            self.method, self.path, self.version)
+
+    def autochunked(self):
+        return (self.length is None and
+                self.version >= HttpVersion11 and
+                self.status not in (304, 204))

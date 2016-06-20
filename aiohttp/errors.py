@@ -1,7 +1,10 @@
-"""http related errors."""
+"""HTTP related errors."""
 
-__all__ = [
-    'ClientDisconnectedError', 'ServerDisconnectedError',
+from asyncio import TimeoutError
+
+
+__all__ = (
+    'DisconnectedError', 'ClientDisconnectedError', 'ServerDisconnectedError',
 
     'HttpProcessingError', 'BadHttpMessage',
     'HttpMethodNotAllowed', 'HttpBadRequest', 'HttpProxyError',
@@ -9,13 +12,14 @@ __all__ = [
 
     'ClientError', 'ClientHttpProcessingError', 'ClientConnectionError',
     'ClientOSError', 'ClientTimeoutError', 'ProxyConnectionError',
-    'ClientRequestError', 'ClientResponseError']
+    'ClientRequestError', 'ClientResponseError',
+    'FingerprintMismatch',
 
-from asyncio import TimeoutError
+    'WSServerHandshakeError', 'WSClientDisconnectedError')
 
 
 class DisconnectedError(Exception):
-    """disconnected."""
+    """Disconnected."""
 
 
 class ClientDisconnectedError(DisconnectedError):
@@ -26,12 +30,16 @@ class ServerDisconnectedError(DisconnectedError):
     """Server disconnected."""
 
 
+class WSClientDisconnectedError(ClientDisconnectedError):
+    """Deprecated."""
+
+
 class ClientError(Exception):
     """Base class for client connection errors."""
 
 
 class ClientHttpProcessingError(ClientError):
-    """Base class for client http processing errors."""
+    """Base class for client HTTP processing errors."""
 
 
 class ClientRequestError(ClientHttpProcessingError):
@@ -63,9 +71,9 @@ class ProxyConnectionError(ClientConnectionError):
 
 
 class HttpProcessingError(Exception):
-    """Http error.
+    """HTTP error.
 
-    Shortcut for raising http errors with custom code, message and headers.
+    Shortcut for raising HTTP errors with custom code, message and headers.
 
     :param int code: HTTP Error code.
     :param str message: (optional) Error message.
@@ -85,8 +93,12 @@ class HttpProcessingError(Exception):
         super().__init__("%s, message='%s'" % (self.code, message))
 
 
+class WSServerHandshakeError(HttpProcessingError):
+    """websocket server handshake error."""
+
+
 class HttpProxyError(HttpProcessingError):
-    """Http proxy error.
+    """HTTP proxy error.
 
     Raised in :class:`aiohttp.connector.ProxyConnector` if
     proxy responds with status other than ``200 OK``
@@ -99,8 +111,8 @@ class BadHttpMessage(HttpProcessingError):
     code = 400
     message = 'Bad Request'
 
-    def __init__(self, message):
-        super().__init__(message=message)
+    def __init__(self, message, *, headers=None):
+        super().__init__(message=message, headers=headers)
 
 
 class HttpMethodNotAllowed(HttpProcessingError):
@@ -133,6 +145,8 @@ class LineTooLong(BadHttpMessage):
 class InvalidHeader(BadHttpMessage):
 
     def __init__(self, hdr):
+        if isinstance(hdr, bytes):
+            hdr = hdr.decode('utf-8', 'surrogateescape')
         super().__init__('Invalid HTTP Header: {}'.format(hdr))
         self.hdr = hdr
 
@@ -156,3 +170,22 @@ class LineLimitExceededParserError(ParserError):
     def __init__(self, msg, limit):
         super().__init__(msg)
         self.limit = limit
+
+
+class FingerprintMismatch(ClientConnectionError):
+    """SSL certificate does not match expected fingerprint."""
+
+    def __init__(self, expected, got, host, port):
+        self.expected = expected
+        self.got = got
+        self.host = host
+        self.port = port
+
+    def __repr__(self):
+        return '<{} expected={} got={} host={} port={}>'.format(
+            self.__class__.__name__, self.expected, self.got,
+            self.host, self.port)
+
+
+class InvalidURL(Exception):
+    """Invalid URL."""

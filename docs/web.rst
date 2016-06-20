@@ -1,98 +1,214 @@
 .. _aiohttp-web:
 
-.. highlight:: python
+HTTP Server Usage
+=================
 
-High-level HTTP Server
-======================
+.. currentmodule:: aiohttp.web
 
-.. module:: aiohttp.web
+.. versionchanged:: 0.12
+   :mod:`aiohttp.web` was deeply refactored making it backwards incompatible.
 
-.. versionadded:: 0.10
 
-Run a simple web server
+Run a Simple Web Server
 -----------------------
 
-For implementing a web server, first create a :ref:`request
-handler<aiohttp-web-handler>`.
+In order to implement a web server, first create a
+:ref:`request handler <aiohttp-web-handler>`.
 
-Handler is a :ref:`coroutine<coroutine>` or a regular function that
-accepts only *request* parameter of type :class:`Request`
-and returns :class:`Response` instance::
+A request handler is a :ref:`coroutine <coroutine>` or regular function that
+accepts a :class:`Request` instance as its only parameter and returns a
+:class:`Response` instance::
 
-   import asyncio
    from aiohttp import web
 
-   @asyncio.coroutine
-   def hello(request):
+   async def hello(request):
        return web.Response(body=b"Hello, world")
 
-Next, you have to create a :class:`Application` instance and register
-:ref:`handler<aiohttp-web-handler>` in the application's router pointing *HTTP
-method*, *path* and *handler*::
+Next, create an :class:`Application` instance and register the
+request handler with the application's :class:`router <UrlDispatcher>` on a
+particular *HTTP method* and *path*::
 
    app = web.Application()
    app.router.add_route('GET', '/', hello)
 
-After that, create a server and run the *asyncio loop* as usual::
+After that, run the application by :func:`run_app` call::
 
-   loop = asyncio.get_event_loop()
-   f = loop.create_server(app.make_handler(), '0.0.0.0', 8080)
-   srv = loop.run_until_complete(f)
-   print('serving on', srv.sockets[0].getsockname())
-   try:
-       loop.run_forever()
-   except KeyboardInterrupt:
-       pass
+   web.run_app(app)
 
-That's it.
+That's it. Now, head over to ``http://localhost:8080/`` to see the results.
+
+.. seealso::
+
+   :ref:`aiohttp-web-graceful-shutdown` section explains what :func:`run_app`
+   does and how to implement complex server initialization/finalization
+   from scratch.
+
+
+.. _aiohttp-web-cli:
+
+Command Line Interface (CLI)
+----------------------------
+:mod:`aiohttp.web` implements a basic CLI for quickly serving an
+:class:`Application` in *development* over TCP/IP::
+
+    $ python -m aiohttp.web -H localhost -P 8080 package.module:init_func
+
+``package.module:init_func`` should be an importable :term:`callable` that
+accepts a list of any non-parsed command-line arguments and returns an
+:class:`Application` instance after setting it up::
+
+    def init_function(argv):
+        app = web.Application()
+        app.router.add_route("GET", "/", index_handler)
+        return app
+
 
 .. _aiohttp-web-handler:
 
 Handler
 -------
 
-Handler is an any *callable* that accepts a single :class:`Request`
-argument and returns a :class:`StreamResponse` derived
-(e.g. :class:`Response`) instance.
+A request handler can be any :term:`callable` that accepts a :class:`Request`
+instance as its only argument and returns a :class:`StreamResponse` derived
+(e.g. :class:`Response`) instance::
 
-Handler **can** be a :ref:`coroutine<coroutine>`, :mod:`aiohttp.web` will
-**unyield** returned result by applying ``yield from`` to the handler.
+   def handler(request):
+       return web.Response()
 
-Handlers are connected to the :class:`Application` via routes::
+A handler **may** also be a :ref:`coroutine<coroutine>`, in which case
+:mod:`aiohttp.web` will ``await`` the handler::
 
-   handler = Handler()
+   async def handler(request):
+       return web.Response()
+
+Handlers are setup to handle requests by registering them with the
+:attr:`Application.router` on a particular route (*HTTP method* and *path*
+pair)::
+
    app.router.add_route('GET', '/', handler)
+   app.router.add_route('POST', '/post', post_handler)
+   app.router.add_route('PUT', '/put', put_handler)
+
+:meth:`~UrlDispatcher.add_route` also supports the wildcard *HTTP method*,
+allowing a handler to serve incoming requests on a *path* having **any**
+*HTTP method*::
+
+  app.router.add_route('*', '/path', all_handler)
+
+The *HTTP method* can be queried later in the request handler using the
+:attr:`Request.method` property.
+
+.. versionadded:: 0.15.2
+
+   Support for wildcard *HTTP method* routes.
+
+
+.. _aiohttp-web-resource-and-route:
+
+Resources and Routes
+--------------------
+
+Internally *router* is a list of *resources*.
+
+Resource is an entry in *route table* which corresponds to requested URL.
+
+Resource in turn has at least one *route*.
+
+Route corresponds to handling *HTTP method* by calling *web handler*.
+
+:meth:`UrlDispatcher.add_route` is just a shortcut for pair of
+:meth:`UrlDispatcher.add_resource` and :meth:`Resource.add_route`::
+
+   resource = app.router.add_resource(path, name=name)
+   route = resource.add_route(method, handler)
+   return route
+
+.. seealso::
+
+   :ref:`aiohttp-router-refactoring-021` for more details
+
+.. versionadded:: 0.21.0
+
+   Introduce resources.
+
 
 .. _aiohttp-web-variable-handler:
 
-You can also use *variable routes*. If route contains string like
-``'/a/{name}/c'`` that means the route matches to the path like
-``'/a/b/c'`` or ``'/a/1/c'``.
+Variable Resources
+^^^^^^^^^^^^^^^^^^
 
-Parsed *path part* will be available in the *request handler* as
-``request.match_info['name']``::
+Resource may have *variable path* also. For instance, a resource with
+the path ``'/a/{name}/c'`` would match all incoming requests with
+paths such as ``'/a/b/c'``, ``'/a/1/c'``, and ``'/a/etc/c'``.
 
-   @asyncio.coroutine
-   def variable_handler(request):
+A variable *part* is specified in the form ``{identifier}``, where the
+``identifier`` can be used later in a
+:ref:`request handler <aiohttp-web-handler>` to access the matched value for
+that *part*. This is done by looking up the ``identifier`` in the
+:attr:`Request.match_info` mapping::
+
+   async def variable_handler(request):
        return web.Response(
            text="Hello, {}".format(request.match_info['name']))
 
-   app.router.add_route('GET', '/{name}', variable_handler)
+   resource = app.router.add_resource('/{name}')
+   resource.add_route('GET', variable_handler)
+
+By default, each *part* matches the regular expression ``[^{}/]+``.
+
+You can also specify a custom regex in the form ``{identifier:regex}``::
+
+   resource = app.router.add_resource(r'/{name:\d+}')
+
+.. versionadded:: 0.13
+   Support for custom regexs in variable routes.
 
 
-Handlers can be first-class functions, e.g.::
+.. _aiohttp-web-named-routes:
 
-   @asyncio.coroutine
-   def hello(request):
+Reverse URL Constructing using Named Resources
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Routes can also be given a *name*::
+
+   resource = app.router.add_resource('/root', name='root')
+
+Which can then be used to access and build a *URL* for that resource later (e.g.
+in a :ref:`request handler <aiohttp-web-handler>`)::
+
+   >>> request.app.router.named_resources()['root'].url(query={"a": "b", "c": "d"})
+   '/root?a=b&c=d'
+
+A more interesting example is building *URLs* for :ref:`variable
+resources <aiohttp-web-variable-handler>`::
+
+   app.router.add_resource(r'/{user}/info', name='user-info')
+
+
+In this case you can also pass in the *parts* of the route::
+
+   >>> request.app.router['user-info'].url(
+   ...     parts={'user': 'john_doe'},
+   ...     query="?a=b")
+   '/john_doe/info?a=b'
+
+
+Organizing Handlers in Classes
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+As discussed above, :ref:`handlers <aiohttp-web-handler>` can be first-class
+functions or coroutines::
+
+   async def hello(request):
        return web.Response(body=b"Hello, world")
 
    app.router.add_route('GET', '/', hello)
 
-Sometimes you would like to group logically coupled handlers into a
-python class.
+But sometimes it's convenient to group logically similar handlers into a Python
+*class*.
 
-:mod:`aiohttp.web` doesn't dictate any implementation details,
-so application developer can use classes if he wants::
+Since :mod:`aiohttp.web` does not dictate any implementation details,
+application developers can organize handlers in classes if they so wish::
 
    class Handler:
 
@@ -102,8 +218,7 @@ so application developer can use classes if he wants::
        def handle_intro(self, request):
            return web.Response(body=b"Hello, world")
 
-       @asyncio.coroutine
-       def handle_greeting(self, request):
+       async def handle_greeting(self, request):
            name = request.match_info.get('name', "Anonymous")
            txt = "Hello, {}".format(name)
            return web.Response(text=txt)
@@ -113,20 +228,242 @@ so application developer can use classes if he wants::
    app.router.add_route('GET', '/greet/{name}', handler.handle_greeting)
 
 
+.. _aiohttp-web-class-based-views:
+
+Class Based Views
+^^^^^^^^^^^^^^^^^
+
+:mod:`aiohttp.web` has support for django-style class based views.
+
+You can derive from :class:`View` and define methods for handling http
+requests::
+
+   class MyView(web.View):
+       async def get(self):
+           return await get_resp(self.request)
+
+       async def post(self):
+           return await post_resp(self.request)
+
+Handlers should be coroutines accepting self only and returning
+response object as regular :term:`web-handler`. Request object can be
+retrieved by :attr:`View.request` property.
+
+After implementing the view (``MyView`` from example above) should be
+registered in application's router::
+
+   app.router.add_route('*', '/path/to', MyView)
+
+Example will process GET and POST requests for */path/to* but raise
+*405 Method not allowed* exception for unimplemented HTTP methods.
+
+Resource Views
+^^^^^^^^^^^^^^
+
+*All* registered resources in a router can be viewed using the
+:meth:`UrlDispatcher.resources` method::
+
+   for resource in app.router.resources():
+       print(resource)
+
+Similarly, a *subset* of the resources that were registered with a *name* can be
+viewed using the :meth:`UrlDispatcher.named_resources` method::
+
+   for name, resource in app.router.named_resources().items():
+       print(name, resource)
+
+
+
+.. versionadded:: 0.18
+   :meth:`UrlDispatcher.routes`
+
+.. versionadded:: 0.19
+   :meth:`UrlDispatcher.named_routes`
+
+.. deprecated:: 0.21
+
+   Use :meth:`UrlDispatcher.named_resources` /
+   :meth:`UrlDispatcher.resources` instead of
+   :meth:`UrlDispatcher.named_routes` / :meth:`UrlDispatcher.routes`.
+
+Custom Routing Criteria
+-----------------------
+
+Sometimes you need to register :ref:`handlers <aiohttp-web-handler>` on
+more complex criteria than simply a *HTTP method* and *path* pair.
+
+Although :class:`UrlDispatcher` does not support any extra criteria, routing
+based on custom conditions can be accomplished by implementing a second layer
+of routing in your application.
+
+The following example shows custom routing based on the *HTTP Accept* header::
+
+   class AcceptChooser:
+
+       def __init__(self):
+           self._accepts = {}
+
+       async def do_route(self, request):
+           for accept in request.headers.getall('ACCEPT', []):
+               acceptor = self._accepts.get(accept)
+               if acceptor is not None:
+                   return (await acceptor(request))
+           raise HTTPNotAcceptable()
+
+       def reg_acceptor(self, accept, handler):
+           self._accepts[accept] = handler
+
+
+   async def handle_json(request):
+       # do json handling
+
+   async def handle_xml(request):
+       # do xml handling
+
+   chooser = AcceptChooser()
+   app.router.add_route('GET', '/', chooser.do_route)
+
+   chooser.reg_acceptor('application/json', handle_json)
+   chooser.reg_acceptor('application/xml', handle_xml)
+
+
+Template Rendering
+------------------
+
+:mod:`aiohttp.web` does not support template rendering out-of-the-box.
+
+However, there is a third-party library, :mod:`aiohttp_jinja2`, which is
+supported by the *aiohttp* authors.
+
+Using it is rather simple. First, setup a *jinja2 environment* with a call
+to :func:`aiohttp_jinja2.setup`::
+
+    app = web.Application(loop=self.loop)
+    aiohttp_jinja2.setup(app,
+        loader=jinja2.FileSystemLoader('/path/to/templates/folder'))
+
+After that you may use the template engine in your
+:ref:`handlers <aiohttp-web-handler>`. The most convenient way is to simply
+wrap your handlers with the  :func:`aiohttp_jinja2.template` decorator::
+
+    @aiohttp_jinja2.template('tmpl.jinja2')
+    def handler(request):
+        return {'name': 'Andrew', 'surname': 'Svetlov'}
+
+If you prefer the `Mako`_ template engine, please take a look at the
+`aiohttp_mako`_ library.
+
+.. _Mako: http://www.makotemplates.org/
+
+.. _aiohttp_mako: https://github.com/aio-libs/aiohttp_mako
+
+
+User Sessions
+-------------
+
+Often you need a container for storing user data across requests. The concept
+is usually called a *session*.
+
+:mod:`aiohttp.web` has no built-in concept of a *session*, however, there is a
+third-party library, :mod:`aiohttp_session`, that adds *session* support::
+
+    import asyncio
+    import time
+    from aiohttp import web
+    from aiohttp_session import get_session, session_middleware
+    from aiohttp_session.cookie_storage import EncryptedCookieStorage
+
+    async def handler(request):
+        session = await get_session(request)
+        session['last_visit'] = time.time()
+        return web.Response(body=b'OK')
+
+    async def init(loop):
+        app = web.Application(middlewares=[session_middleware(
+            EncryptedCookieStorage(b'Sixteen byte key'))])
+        app.router.add_route('GET', '/', handler)
+        srv = await loop.create_server(
+            app.make_handler(), '0.0.0.0', 8080)
+        return srv
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(init(loop))
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+.. _aiohttp-web-expect-header:
+
+*Expect* Header
+---------------
+
+.. versionadded:: 0.15
+
+:mod:`aiohttp.web` supports *Expect* header. By default it sends
+``HTTP/1.1 100 Continue`` line to client, or raises
+:exc:`HTTPExpectationFailed` if header value is not equal to
+"100-continue". It is possible to specify custom *Expect* header
+handler on per route basis. This handler gets called if *Expect*
+header exist in request after receiving all headers and before
+processing application's :ref:`aiohttp-web-middlewares` and
+route handler. Handler can return *None*, in that case the request
+processing continues as usual. If handler returns an instance of class
+:class:`StreamResponse`, *request handler* uses it as response. Also
+handler can raise a subclass of :exc:`HTTPException`. In this case all
+further processing will not happen and client will receive appropriate
+http response.
+
+.. note::
+    A server that does not understand or is unable to comply with any of the
+    expectation values in the Expect field of a request MUST respond with
+    appropriate error status. The server MUST respond with a 417
+    (Expectation Failed) status if any of the expectations cannot be met or,
+    if there are other problems with the request, some other 4xx status.
+
+    http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.20
+
+If all checks pass, the custom handler *must* write a *HTTP/1.1 100 Continue*
+status code before returning.
+
+The following example shows how to setup a custom handler for the *Expect*
+header::
+
+   async def check_auth(request):
+       if request.version != aiohttp.HttpVersion11:
+           return
+
+       if request.headers.get('EXPECT') != '100-continue':
+           raise HTTPExpectationFailed(text="Unknown Expect: %s" % expect)
+
+       if request.headers.get('AUTHORIZATION') is None:
+           raise HTTPForbidden()
+
+       request.transport.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+
+   async def hello(request):
+       return web.Response(body=b"Hello, world")
+
+   app = web.Application()
+   app.router.add_route('GET', '/', hello, expect_handler=check_auth)
+
+
 .. _aiohttp-web-file-upload:
 
 File Uploads
 ------------
 
-There are two steps necessary for handling file uploads. The first is
-to make sure that you have a form that has been setup correctly to accept
-files. This means adding *enctype* attribute to your form element with
-the value of *multipart/form-data*. A very simple example would be a
-form that accepts a mp3 file. Notice, we have set up the form as
-previously explained and also added the *input* element of the *file*
-type::
+:mod:`aiohttp.web` has built-in support for handling files uploaded from the
+browser.
 
-   <form action="/store_mp3" method="post" accept-charset="utf-8"
+First, make sure that the HTML ``<form>`` element has its *enctype* attribute
+set to ``enctype="multipart/form-data"``. As an example, here is a form that
+accepts a MP3 file:
+
+.. code-block:: html
+
+   <form action="/store/mp3" method="post" accept-charset="utf-8"
          enctype="multipart/form-data">
 
        <label for="mp3">Mp3</label>
@@ -135,905 +472,99 @@ type::
        <input type="submit" value="submit" />
    </form>
 
-The second step is handling the file upload in your :ref:`request
-handler<aiohttp-web-handler>` (here assumed to answer on
-*/store_mp3*). The uploaded file is added to the request object as a
-:class:`FileField` object accessible through the :meth:`Request.post`
-coroutine. The two properties we are interested in are
-:attr:`~FileField.file` and :attr:`~FileField.filename` and we will
-use those to read a file's name and a content::
+Then, in the :ref:`request handler <aiohttp-web-handler>` you can access the
+file input field as a :class:`FileField` instance. :class:`FileField` is simply
+a container for the file as well as some of its metadata::
 
-    import os
-    import uuid
-    from aiohttp.web import Response
+    async def store_mp3_handler(request):
 
-    def store_mp3_view(request):
+        data = await request.post()
 
-        data = yield from request.post()
+        mp3 = data['mp3']
 
-        # ``filename`` contains the name of the file in string format.
-        filename = data['mp3'].filename
+        # .filename contains the name of the file in string format.
+        filename = mp3.filename
 
-        # ``input_file`` contains the actual file data which needs to be
-        # stored somewhere.
+        # .file contains the actual file data that needs to be stored somewhere.
+        mp3_file = data['mp3'].file
 
-        input_file = data['mp3'].file
+        content = mp3_file.read()
 
-        content = input_file.read()
-
-        return Response(body=content,
-                        headers=MultiDict({'CONTENT-DISPOSITION': input_file})
+        return web.Response(body=content,
+                            headers=MultiDict(
+                                {'CONTENT-DISPOSITION': mp3_file})
 
 
-.. _aiohttp-web-request:
+.. _aiohttp-web-websockets:
 
+WebSockets
+----------
 
-Request
--------
+.. versionadded:: 0.14
 
-The Request object contains all the information about an incoming HTTP request.
+:mod:`aiohttp.web` supports *WebSockets* out-of-the-box.
 
-Every :ref:`handler<aiohttp-web-handler>` accepts a request instance as the
-first positional parameter.
+To setup a *WebSocket*, create a :class:`WebSocketResponse` in a
+:ref:`request handler <aiohttp-web-handler>` and then use it to communicate
+with the peer::
+
+    async def websocket_handler(request):
+
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        async for msg in ws:
+            if msg.tp == aiohttp.MsgType.text:
+                if msg.data == 'close':
+                    await ws.close()
+                else:
+                    ws.send_str(msg.data + '/answer')
+            elif msg.tp == aiohttp.MsgType.error:
+                print('ws connection closed with exception %s' %
+                      ws.exception())
+
+        print('websocket connection closed')
+
+        return ws
+
+Reading from the *WebSocket* (``await ws.receive()``) **must only** be
+done inside the request handler *task*; however, writing
+(``ws.send_str(...)``) to the *WebSocket* may be delegated to other tasks.
+*aiohttp.web* creates an implicit :class:`asyncio.Task` for handling every
+incoming request.
 
 .. note::
 
-   You should never create the :class:`Request` instance manually --
-   :mod:`aiohttp.web` does it for you.
+   While :mod:`aiohttp.web` itself only supports *WebSockets* without
+   downgrading to *LONG-POLLING*, etc., our team supports SockJS_, an
+   aiohttp-based library for implementing SockJS-compatible server
+   code.
 
-.. class:: Request
+.. _SockJS: https://github.com/aio-libs/sockjs
 
-   .. attribute:: method
 
-      *HTTP method*, Read-only property.
-
-      The value is upper-cased :class:`str` like ``"GET"``,
-      ``"POST"``, ``"PUT"`` etc.
-
-   .. attribute:: version
-
-      *HTTP version* of request, Read-only property.
-
-      Returns :class:`aiohttp.protocol.HttpVersion` instance.
-
-   .. attribute:: host
-
-      *HOST* header of request, Read-only property.
-
-      Returns :class:`str` or ``None`` if HTTP request has no *HOST* header.
-
-   .. attribute:: path_qs
-
-      The URL including PATH_INFO and the query string. e.g, ``/app/blog?id=10``
-
-      Read-only :class:`str` property.
-
-   .. attribute:: path
-
-      The URL including *PATH INFO* without the host or scheme. e.g.,
-      ``/app/blog``
-
-      Read-only :class:`str` property.
-
-   .. attribute:: query_string
-
-      The query string in the URL, e.g., ``id=10``
-
-      Read-only :class:`str` property.
-
-   .. attribute:: GET
-
-      A multidict with all the variables in the query string.
-
-      Read-only :class:`~aiohttp.multidict.MultiDict` lazy property.
-
-   .. attribute:: POST
-
-      A multidict with all the variables in the POST parameters.
-      POST property available only after :meth:`Request.post` coroutine call.
-
-      Read-only :class:`~aiohttp.multidict.MultiDict`.
-
-      :raises RuntimeError: if :meth:`Request.post` was not called \
-                            before accessing the property.
-
-   .. attribute:: headers
-
-      A case-insensitive multidict with all headers.
-
-      Read-only :class:`~aiohttp.multidict.CaseInsensitiveMultiDict`
-      lazy property.
-
-   .. attribute:: keep_alive
-
-      ``True`` if keep-alive connection enabled by HTTP client and
-      protocol version supports it, otherwise ``False``.
-
-      Read-only :class:`bool` property.
-
-   .. attribute:: match_info
-
-      Read-only property with :class:`~aiohttp.abc.AbstractMatchInfo`
-      instance for result of route resolving.
-
-      .. note::
-
-         Exact type of property depends on used router.  If
-         ``app.router`` is :class:`UrlDispatcher` the property contains
-         :class:`UrlMappingMatchInfo` instance.
-
-   .. attribute:: app
-
-      An :class:`Application` instance used to call :ref:`request handler
-      <aiohttp-web-handler>`, Read-only property.
-
-   .. attribute:: transport
-
-      An :ref:`transport<asyncio-transport>` used to process request,
-      Read-only property.
-
-      The property can be used, for example, for getting IP address of
-      client's peer::
-
-         peername = request.transport.get_extra('peername')
-         if peername is not None:
-             host, port = peername
-
-   .. attribute:: cookies
-
-      A multidict of all request's cookies.
-
-      Read-only :class:`~aiohttp.multidict.MultiDict` lazy property.
-
-   .. attribute:: payload
-
-      A :class:`~aiohttp.streams.FlowControlStreamReader` instance,
-      input stream for reading request's *BODY*.
-
-      Read-only property.
-
-   .. attribute:: content_type
-
-      Read-only property with *content* part of *Content-Type* header.
-
-      Returns :class:`str` like ``'text/html'``
-
-      .. note::
-
-         Returns value is ``'application/octet-stream'`` if no
-         Content-Type header present in HTTP headers according to
-         :rfc:`2616`
-
-   .. attribute:: charset
-
-      Read-only property that specifies the *encoding* for the request's BODY.
-
-      The value is parsed from the *Content-Type* HTTP header.
-
-      Returns :class:`str` like ``'utf-8'`` or ``None`` if
-      *Content-Type* has no charset information.
-
-   .. attribute:: content_length
-
-      Read-only property that returns length of the request's BODY.
-
-      The value is parsed from the *Content-Length* HTTP header.
-
-      Returns :class:`int` or ``None`` if *Content-Length* is absent.
-
-   .. method:: read()
-
-      Read request body, returns :class:`bytes` object with body content.
-
-      The method is a :ref:`coroutine <coroutine>`.
-
-      .. warning::
-
-         The method doesn't store read data internally, subsequent
-         :meth:`~Request.read` call will return empty bytes ``b''``.
-
-   .. method:: text()
-
-      Read request body, decode it using :attr:`charset` encoding or
-      ``UTF-8`` if no encoding was specified in *MIME-type*.
-
-      Returns :class:`str` with body content.
-
-      The method is a :ref:`coroutine <coroutine>`.
-
-      .. warning::
-
-         The method doesn't store read data internally, subsequent
-         :meth:`~Request.text` call will return empty string ``''``.
-
-   .. method:: json(*, loader=json.loads)
-
-      Read request body decoded as *json*.
-
-      The method is just a boilerplate :ref:`coroutine <coroutine>`
-      implemented as::
-
-         @asyncio.coroutine
-         def json(self, *, loader=json.loads):
-             body = yield from self.text()
-             return loader(body)
-
-      :param callable loader: any callable that accepts :class:`str`
-                              and returns :class:`dict` with parsed
-                              JSON (:func:`json.loads` by default).
-
-      .. warning::
-
-         The method doesn't store read data internally, subsequent
-         :meth:`~Request.json` call will raise an exception.
-
-   .. method:: post()
-
-      A :ref:`coroutine <coroutine>` that reads POST parameters from
-      request body.
-
-      Returns :class:`~aiohttp.multidict.MultiDict` instance filled
-      with parsed data.
-
-      If :attr:`method` is not *POST*, *PUT* or *PATCH* or
-      :attr:`content_type` is not empty or
-      *application/x-www-form-urlencoded* or *multipart/form-data*
-      returns empty multidict.
-
-      .. warning::
-
-         The method **does** store read data internally, subsequent
-         :meth:`~Request.post` call will return the same value.
-
-   .. method:: release()
-
-      Release request.
-
-      Eat unread part of HTTP BODY if present.
-
-      The method is a :ref:`coroutine <coroutine>`.
-
-      .. note::
-
-          User code may never call :meth:`~Request.release`, all
-          required work will be processed by :mod:`aiohttp.web`
-          internal machinery.
-
-
-.. _aiohttp-web-response:
-
-
-Response classes
------------------
-
-For now, :mod:`aiohttp.web` has two classes for the *HTTP response*:
-:class:`StreamResponse` and :class:`Response`.
-
-Usually you need to use the second one. :class:`StreamResponse` is
-intended for streaming data, while :class:`Response` contains *HTTP
-BODY* as an attribute and sends own content as single piece with the
-correct *Content-Length HTTP header*.
-
-For sake of design decisions :class:`Response` is derived from
-:class:`StreamResponse` parent class.
-
-The response supports *keep-alive* handling out-of-the-box if
-*request* supports it.
-
-You can disable *keep-alive* by :meth:`~StreamResponse.force_close` though.
-
-The common case for sending an answer from
-:ref:`web-handler<aiohttp-web-handler>` is returning a
-:class:`Response` instance::
-
-   def handler(request):
-       return Response("All right!")
-
-
-StreamResponse
-^^^^^^^^^^^^^^
-
-.. class:: StreamResponse(*, status=200, reason=None)
-
-   The base class for the *HTTP response* handling.
-
-   Contains methods for setting *HTTP response headers*, *cookies*,
-   *response status code*, writing *HTTP response BODY* and so on.
-
-   The most important thing you should know about *response* --- it
-   is *Finite State Machine*.
-
-   That means you can do any manipulations with *headers*,
-   *cookies* and *status code* only before :meth:`start`
-   called.
-
-   Once you call :meth:`start` any change of
-   the *HTTP header* part will raise :exc:`RuntimeError` exception.
-
-   Any :meth:`write` call after :meth:`write_eof` is also forbidden.
-
-   :param int status: HTTP status code, ``200`` by default.
-
-   :param str reason: HTTP reason. If param is ``None`` reason will be
-                      calculated basing on *status*
-                      parameter. Otherwise pass :class:`str` with
-                      arbitrary *status* explanation..
-
-   .. attribute:: status
-
-      Read-only property for *HTTP response status code*, :class:`int`.
-
-      ``200`` (OK) by default.
-
-   .. attribute:: reason
-
-      Read-only property for *HTTP response reason*, :class:`str`.
-
-   .. method:: set_status(status, reason=None)
-
-      Set :attr:`status` and :attr:`reason`.
-
-      *reason* value is auto calculated if not specified (``None``).
-
-   .. attribute:: keep_alive
-
-      Read-only property, copy of :attr:`Request.keep_alive` by default.
-
-      Can be switched to ``False`` by :meth:`force_close` call.
-
-   .. method:: force_close
-
-      Disable :attr:`keep_alive` for connection. There are no ways to
-      enable it back.
-
-   .. attribute:: headers
-
-      :class:`~aiohttp.multidict.CaseInsensitiveMultiDict` instance
-      for *outgoing* *HTTP headers*.
-
-   .. attribute:: cookies
-
-      An instance of :class:`http.cookies.SimpleCookie` for *outgoing* cookies.
-
-      .. warning::
-
-         Direct setting up *Set-Cookie* header may be overwritten by
-         explicit calls to cookie manipulation.
-
-         We are encourage using of :attr:`cookies` and
-         :meth:`set_cookie`, :meth:`del_cookie` for cookie
-         manipulations.
-
-   .. method:: set_cookie(name, value, *, expires=None, \
-                   domain=None, max_age=None, path=None, \
-                   secure=None, httponly=None, version=None)
-
-      Convenient way for setting :attr:`cookies`, allows to specify
-      some additional properties like *max_age* in a single call.
-
-      :param str name: cookie name
-
-      :param str value: cookie value (will be converted to
-                        :class:`str` if value has another type).
-
-      :param expries: expiration date (optional)
-
-      :param str domain: cookie domain (optional)
-
-      :param int max_age: defines the lifetime of the cookie, in
-                          seconds.  The delta-seconds value is a
-                          decimal non- negative integer.  After
-                          delta-seconds seconds elapse, the client
-                          should discard the cookie.  A value of zero
-                          means the cookie should be discarded
-                          immediately.  (optional)
-
-      :param str path: specifies the subset of URLs to
-                       which this cookie applies. (optional)
-
-      :param bool secure: attribute (with no value) directs
-                          the user agent to use only (unspecified)
-                          secure means to contact the origin server
-                          whenever it sends back this cookie.
-                          The user agent (possibly under the user's
-                          control) may determine what level of
-                          security it considers appropriate for
-                          "secure" cookies.  The *secure* should be
-                          considered security advice from the server
-                          to the user agent, indicating that it is in
-                          the session's interest to protect the cookie
-                          contents. (optional)
-
-      :param bool httponly: ``True`` if the cookie HTTP only (optional)
-
-      :param int version: a decimal integer, identifies to which
-                          version of the state management
-                          specification the cookie
-                          conforms. (Optional, *version=1* by default)
-
-   .. method:: del_cookie(name, *, domain=None, path=None)
-
-      Deletes cookie.
-
-      :param str name: cookie name
-
-      :param str domain: optional cookie domain
-
-      :param str path: optional cookie path
-
-   .. attribute:: content_length
-
-      *Content-Length* for outgoing response.
-
-   .. attribute:: content_type
-
-      *Content* part of *Content-Type* for outgoing response.
-
-   .. attribute:: charset
-
-      *Charset* aka *encoding* part of *Content-Type* for outgoing response.
-
-   .. method:: start(request)
-
-      :param aiohttp.web.Request request: HTTP request object, that the
-                                          response answers.
-
-      Send *HTTP header*. You should not change any header data after
-      calling this method.
-
-   .. method:: write(data)
-
-      Send byte-ish data as the part of *response BODY*.
-
-      :meth:`start` must be called before.
-
-      Raises :exc:`TypeError` if data is not :class:`bytes`,
-      :class:`bytearray` or :class:`memoryview` instance.
-
-      Raises :exc:`RuntimeError` if :meth:`start` has not been called.
-
-      Raises :exc:`RuntimeError` if :meth:`write_eof` has been called.
-
-   .. method:: write_eof()
-
-      A :ref:`coroutine<coroutine>` *may* be called as a mark of the
-      *HTTP response* processing finish.
-
-      *Internal machinery* will call this method at the end of
-      the request processing if needed.
-
-      After :meth:`write_eof` call any manipulations with the *response*
-      object are forbidden.
-
-
-Response
-^^^^^^^^
-
-.. class:: Response(*, status=200, headers=None, content_type=None, \
-                    body=None, text=None)
-
-   The most usable response class, inherited from :class:`StreamResponse`.
-
-   Accepts *body* argument for setting the *HTTP response BODY*.
-
-   The actual :attr:`body` sending happens in overridden
-   :meth:`~StreamResponse.write_eof`.
-
-   :param bytes body: response's BODY
-
-   :param int status: HTTP status code, 200 OK by default.
-
-   :param collections.abc.Mapping headers: HTTP headers that should be added to
-                           response's ones.
-
-   :param str text: response's BODY
-
-   :param str content_type: response's content type
-
-   .. attribute:: body
-
-      Read-write attribute for storing response's content aka BODY,
-      :class:`bytes`.
-
-      Setting :attr:`body` also recalculates
-      :attr:`~StreamResponse.content_length` value.
-
-      Resetting :attr:`body` (assigning ``None``) sets
-      :attr:`~StreamResponse.content_length` to ``None`` too, dropping
-      *Content-Length* HTTP header.
-
-   .. attribute:: text
-
-      Read-write attribute for storing response's content, represented as str,
-      :class:`str`.
-
-      Setting :attr:`str` also recalculates
-      :attr:`~StreamResponse.content_length` value and
-      :attr:`~StreamResponse.body` value
-
-      Resetting :attr:`body` (assigning ``None``) sets
-      :attr:`~StreamResponse.content_length` to ``None`` too, dropping
-      *Content-Length* HTTP header.
-
-
-Application and Router
-----------------------
-
-
-Application
-^^^^^^^^^^^
-
-Application is a synonym for web-server.
-
-To get fully working example, you have to make *application*, register
-supported urls in *router* and create a *server socket* with
-:class:`aiohttp.RequestHandlerFactory` as a *protocol factory*. *RequestHandlerFactory*
-could be constructed with :meth:`make_handler`.
-
-*Application* contains a *router* instance and a list of callbacks that
-will be called during application finishing.
-
-*Application* is a :class:`dict`, so you can use it as registry for
-arbitrary properties for later access from
-:ref:`handler<aiohttp-web-handler>` via :attr:`Request.app` property::
-
-   app = Application(loop=loop)
-   app['database'] = yield from aiopg.create_engine(**db_config)
-
-   @asyncio.coroutine
-   def handler(request):
-       with (yield from request.app['database']) as conn:
-           conn.execute("DELETE * FROM table")
-
-
-.. class:: Application(*, loop=None, router=None, logger=<default>, **kwargs)
-
-   The class inherits :class:`dict`.
-
-   :param loop: :ref:`event loop<asyncio-event-loop>` used
-                for processing HTTP requests.
-
-                If param is ``None`` :func:`asyncio.get_event_loop`
-                used for getting default event loop, but we strongly
-                recommend to use explicit loops everywhere.
-
-   :param router: :class:`aiohttp.abc.AbstractRouter` instance, the system
-                  creates :class:`UrlDispatcher` by default if
-                  *router* is ``None``.
-
-   :param logger: :class:`logging.Logger` instance for storing application logs.
-
-                  By default the value is ``logging.getLogger("aiohttp.web")``
-
-   :param kwargs: optional params for initializing self dict.
-
-   .. attribute:: router
-
-      Read-only property that returns *router instance*.
-
-   .. attribute:: logger
-
-      Read-only property that returns *router instance*.
-
-   .. attribute:: loop
-
-      :class:`logging.Logger` instance for storing application logs.
-
-   .. method:: make_handler(**kwargs)
-
-      Creates HTTP protocol factory for handling requests.
-
-      :param kwargs: additional parameters for :class:`RequestHandlerFactory`
-                     constructor.
-
-      You should pass result of the method as *protocol_factory* to
-      :meth:`~BaseEventLoop.create_server`, e.g.::
-
-         loop = asyncio.get_event_loop()
-
-         app = Application(loop=loop)
-
-         # setup route table
-         # app.router.add_route(...)
-
-         yield from loop.create_server(app.make_handler(), '0.0.0.0', 8080)
-
-   .. method:: finish()
-
-      A :ref:`coroutine<coroutine>` that should be called after
-      server stopping.
-
-      This method executes functions registered by
-      :meth:`register_on_finish` in LIFO order.
-
-      If callback raises an exception, the error will be stored by
-      :meth:`~asyncio.BaseEventLoop.call_exception_handler` with keys:
-      *message*, *exception*, *application*.
-
-   .. method:: register_on_finish(self, func, *args, **kwargs):
-
-      Register *func* as a function to be executed at termination.
-      Any optional arguments that are to be passed to *func* must be
-      passed as arguments to :meth:`register_on_finish`.  It is possible to
-      register the same function and arguments more than once.
-
-      During the call of :meth:`finish` all functions registered are called in
-      last in, first out order.
-
-      *func* may be either regular function or :ref:`coroutine<coroutine>`,
-      :meth:`finish` will un-yield (`yield from`) the later.
-
-
-RequestHandlerFactory
-^^^^^^^^^^^^^^^^^^^^^
-
-RequestHandlerFactory is responsible for creating HTTP protocol objects that
-can handle http connections.
-
-   .. attribute:: connections
-
-      List of all currently oppened connections.
-
-   .. method:: finish_connections(timeout)
-
-      A :ref:`coroutine<coroutine>` that should be called to close all opened
-      connections.
-
-
-Router
-^^^^^^
-
-For dispatching URLs to :ref:`handlers<aiohttp-web-handler>`
-:mod:`aiohttp.web` uses *routers*.
-
-Router is any object that implements :class:`AbstractRouter` interface.
-
-:mod:`aiohttp.web` provides an implementation called :class:`UrlDispatcher`.
-
-:class:`Application` uses :class:`UrlDispatcher` as :meth:`router` by default.
-
-.. class:: UrlDispatcher()
-
-   Straightforward url-mathing router, implements
-   :class:`collections.abc.Mapping` for access to *named routes*.
-
-   Before running :class:`Application` you should fill *route
-   table* first by calling :meth:`add_route` and :meth:`add_static`.
-
-   :ref:`Handler<aiohttp-web-handler>` lookup is performed by iterating on
-   added *routes* in FIFO order. The first matching *route* will be used
-   to call corresponding *handler*.
-
-   If on route creation you specify *name* parameter the result is
-   *named route*.
-
-   *Named route* can be retrieved by ``app.router[name]`` call, checked for
-   existence by ``name in app.router`` etc.
-
-   .. seealso:: :ref:`Route classes <aiohttp-web-route>`
-
-   .. method:: add_route(method, path, handler, *, name=None)
-
-      Append :ref:`handler<aiohttp-web-handler>` to the end of route table.
-
-      *path* may be either *constant* string like ``'/a/b/c'`` or
-       *variable rule* like ``'/a/{var}'`` (see
-       :ref:`handling variable pathes<aiohttp-web-variable-handler>`)
-
-      Pay attention please: *handler* is converted to coroutine internally when
-      it is a regular function.
-
-      :param str path: route path
-
-      :param callable handler: route handler
-
-      :param str name: optional route name.
-
-      :returns: new :class:`PlainRoute` or :class:`DynamicRoute` instance.
-
-   .. method:: add_static(prefix, path, *, name=None)
-
-      Adds router for returning static files.
-
-      Useful for handling static content like images, javascript and css files.
-
-      .. warning::
-
-         Use :meth:`add_static` for development only. In production,
-         static content should be processed by web servers like *nginx*
-         or *apache*.
-
-      :param str prefix: URL path prefix for handled static files
-
-      :param str path: path to the folder in file system that contains
-                       handled static files.
-
-      :param str name: optional route name.
-
-      :returns: new :class:`StaticRoute` instance.
-
-   .. method:: resolve(requst)
-
-      A :ref:`coroutine<coroutine>` that returns
-      :class:`AbstractMatchInfo` for *request* or raises http
-      exception like :exc:`HTTPNotFound` if there is no registered
-      route for *request*.
-
-      Used by internal machinery, end user unlikely need to call the method.
-
-.. _aiohttp-web-route:
-
-Route
-^^^^^
-
-.. versionadded:: 0.11
-
-Default router :class:`UrlDispatcher` operates with *routes*.
-
-User should not instantiate route classes by hand but can give *named
-route instance* by ``router[name]`` if he have added route by
-:meth:`UrlDispatcher.add_route` or :meth:`UrlDispatcher.add_static`
-calls with non-empty *name* parameter.
-
-The main usage of *named routes* is constructing URL by route name for
-passing it into *template engine* for example::
-
-   url = app.router['route_name'].url(query={'a': 1, 'b': 2})
-
-There are three conctrete route classes:* :class:`DynamicRoute` for
-urls with :ref:`variable pathes<aiohttp-web-variable-handler>` spec.
-
-
-* :class:`PlainRoute` for urls without :ref:`variable
-  pathes<aiohttp-web-variable-handler>`
-
-* :class:`DynamicRoute` for urls with :ref:`variable
-  pathes<aiohttp-web-variable-handler>` spec.
-
-* :class:`StaticRoute` for static file handlers.
-
-.. class:: Route
-
-   Base class for routes served by :class:`UrlDispatcher`.
-
-   .. attribute:: method
-
-   HTTP method handled by the route, e.g. *GET*, *POST* etc.
-
-   .. attribute:: handler
-
-   :ref:`handler<aiohttp-web-handler>` that processes the route.
-
-   .. attribute:: name
-
-   Name of the route.
-
-   .. method:: match(path)
-
-   Abstract method, accepts *URL path* and returns :class:`dict` with
-   parsed *path parts* for :class:`UrlMappingMatchInfo` or ``None`` if
-   the route cannot handle given *path*.
-
-   The method exists for internal usage, end user unlikely need to call it.
-
-   .. method:: url(*, query=None, **kwargs)
-
-   Abstract method for constructing url handled by the route.
-
-   *query* is a mapping or list of *(name, value)* pairs for
-   specifying *query* part of url (parameter is processed by
-   :func:`~urllib.parse.urlencode`).
-
-   Other available parameters depends on concrete route class and
-   described in descendant classes.
-
-.. class:: PlainRoute
-
-   The route class for handling plain *URL path*, e.g. ``"/a/b/c"``
-
-   .. method:: url(*, parts, query=None)
-
-   Construct url, doesn't accepts extra parameters::
-
-      >>> route.url(query={'d': 1, 'e': 2})
-      '/a/b/c/?d=1&e=2'``
-
-.. class:: DynamicRoute
-
-   The route class for handling :ref:`variable
-   path<aiohttp-web-variable-handler>`, e.g. ``"/a/{name1}/{name2}"``
-
-   .. method:: url(*, parts, query=None)
-
-   Construct url with given *dynamic parts*::
-
-       >>> route.url(parts={'name1': 'b', 'name2': 'c'}, query={'d': 1, 'e': 2})
-       '/a/b/c/?d=1&e=2'
-
-
-.. class:: StaticRoute
-
-   The route class for handling static files, created by
-   :meth:`UrlDispatcher.add_static` call.
-
-   .. method:: url(*, filename, query=None)
-
-   Construct url for given *filename*::
-
-      >>> route.url(filename='img/logo.png', query={'param': 1})
-      '/path/to/static/img/logo.png?param=1'
-
-MatchInfo
-^^^^^^^^^
-
-After route matching web application calls found handler if any.
-
-Matching result can be accessible from handler as
-:attr:`Request.match_info` attribute.
-
-In general the result may be any object derived from
-:class:`AbstractMatchInfo` (:class:`UrlMappingMatchInfo` for default
-:class:`UrlDispatcher` router).
-
-.. class:: UrlMappingMatchInfo
-
-   Inherited from :class:`dict` and :class:`AbstractMatchInfo`. Dict
-   items are given from :meth:`Route.match` call return value.
-
-   .. attribute:: route
-
-   :class:`Route` instance for url matching.
-
-
-
-Utilities
----------
-
-.. class:: FileField
-
-   A :func:`~collections.namedtuple` that is returned as multidict value
-   by :meth:`Request.POST` if field is uploaded file.
-
-   .. attribute:: name
-
-      Field name
-
-   .. attribute:: filename
-
-      File name as specified by uploading (client) side.
-
-   .. attribute:: file
-
-      An :class:`io.IOBase` instance with content of uploaded file.
-
-   .. attribute:: content_type
-
-      *MIME type* of uploaded file, ``'text/plain'`` by default.
-
-   .. seealso:: :ref:`aiohttp-web-file-upload`
-
+.. _aiohttp-web-exceptions:
 
 Exceptions
------------
+----------
 
-:mod:`aiohttp.web` defines exceptions for list of *HTTP status codes*.
+:mod:`aiohttp.web` defines a set of exceptions for every *HTTP status code*.
 
-Each class relates to a single HTTP status code.  Each class is a
-subclass of the :class:`~HTTPException`.
+Each exception is a subclass of :class:`~HTTPException` and relates to a single
+HTTP status code.
 
-Those exceptions are derived from :class:`Response` too, so you can
-either return exception object from :ref:`aiohttp-web-handler` or raise it.
+The exceptions are also a subclass of :class:`Response`, allowing you to either
+``raise`` or ``return`` them in a
+:ref:`request handler <aiohttp-web-handler>` for the same effect.
 
-The following snippets are equal::
+The following snippets are the same::
 
-    @asyncio.coroutine
-    def handler(request):
+    async def handler(request):
         return aiohttp.web.HTTPFound('/redirect')
 
 and::
 
-    @asyncio.coroutine
-    def handler(request):
+    async def handler(request):
         raise aiohttp.web.HTTPFound('/redirect')
 
 
@@ -1041,7 +572,7 @@ Each exception class has a status code according to :rfc:`2068`:
 codes with 100-300 are not really errors; 400s are client errors,
 and 500s are server errors.
 
-Http Exception hierarchy chart::
+HTTP Exception hierarchy chart::
 
    Exception
      HTTPException
@@ -1061,6 +592,7 @@ Http Exception hierarchy chart::
          * 304 - HTTPNotModified
          * 305 - HTTPUseProxy
          * 307 - HTTPTemporaryRedirect
+         * 308 - HTTPPermanentRedirect
        HTTPError
          HTTPClientError
            * 400 - HTTPBadRequest
@@ -1081,6 +613,12 @@ Http Exception hierarchy chart::
            * 415 - HTTPUnsupportedMediaType
            * 416 - HTTPRequestRangeNotSatisfiable
            * 417 - HTTPExpectationFailed
+           * 421 - HTTPMisdirectedRequest
+           * 426 - HTTPUpgradeRequired
+           * 428 - HTTPPreconditionRequired
+           * 429 - HTTPTooManyRequests
+           * 431 - HTTPRequestHeaderFieldsTooLarge
+           * 451 - HTTPUnavailableForLegalReasons
          HTTPServerError
            * 500 - HTTPInternalServerError
            * 501 - HTTPNotImplemented
@@ -1088,27 +626,360 @@ Http Exception hierarchy chart::
            * 503 - HTTPServiceUnavailable
            * 504 - HTTPGatewayTimeout
            * 505 - HTTPVersionNotSupported
+           * 506 - HTTPVariantAlsoNegotiates
+           * 510 - HTTPNotExtended
+           * 511 - HTTPNetworkAuthenticationRequired
 
-All http exceptions have the same constructor::
+All HTTP exceptions have the same constructor signature::
 
-    HTTPNotFound(*, headers=None, reason=None, \
+    HTTPNotFound(*, headers=None, reason=None,
                  body=None, text=None, content_type=None)
 
-if other not directly specified. *headers* will be added to *default
+If not directly specified, *headers* will be added to the *default
 response headers*.
 
 Classes :class:`HTTPMultipleChoices`, :class:`HTTPMovedPermanently`,
 :class:`HTTPFound`, :class:`HTTPSeeOther`, :class:`HTTPUseProxy`,
-:class:`HTTPTemporaryRedirect` has constructor signature like::
+:class:`HTTPTemporaryRedirect` have the following constructor signature::
 
-    HTTPFound(location, *, headers=None, reason=None, \
+    HTTPFound(location, *, headers=None, reason=None,
               body=None, text=None, content_type=None)
 
 where *location* is value for *Location HTTP header*.
 
-:class:`HTTPMethodNotAllowed` constructed with pointing trial method
-and list of allowed methods::
+:class:`HTTPMethodNotAllowed` is constructed by providing the incoming
+unsupported method and list of allowed methods::
 
     HTTPMethodNotAllowed(method, allowed_methods, *,
-                         headers=None, reason=None, \
+                         headers=None, reason=None,
                          body=None, text=None, content_type=None)
+
+
+.. _aiohttp-web-data-sharing:
+
+Data Sharing
+------------
+
+:mod:`aiohttp.web` discourages the use of *global variables*, aka *singletons*.
+Every variable should have it's own context that is *not global*.
+
+So, :class:`aiohttp.web.Application` and :class:`aiohttp.web.Request`
+support a :class:`collections.abc.MutableMapping` interface (i.e. they are
+dict-like objects), allowing them to be used as data stores.
+
+For storing *global-like* variables, feel free to save them in an
+:class:`~.Application` instance::
+
+    app['my_private_key'] = data
+
+and get it back in the :term:`web-handler`::
+
+    async def handler(request):
+        data = request.app['my_private_key']
+
+Variables that are only needed for the lifetime of a :class:`~.Request`, can be
+stored in a :class:`~.Request`::
+
+    async def handler(request):
+      request['my_private_key'] = "data"
+      ...
+
+This is mostly useful for :ref:`aiohttp-web-middlewares` and
+:ref:`aiohttp-web-signals` handlers to store data for further processing by the
+next handlers in the chain.
+
+To avoid clashing with other *aiohttp* users and third-party libraries, please
+choose a unique key name for storing data.
+
+If your code is published on PyPI, then the project name is most likely unique
+and safe to use as the key.
+Otherwise, something based on your company name/url would be satisfactory (i.e
+``org.company.app``).
+
+
+.. _aiohttp-web-middlewares:
+
+Middlewares
+-----------
+
+.. versionadded:: 0.13
+
+:mod:`aiohttp.web` provides a powerful mechanism for customizing
+:ref:`request handlers<aiohttp-web-handler>` via *middlewares*.
+
+*Middlewares* are setup by providing a sequence of *middleware factories* to
+the keyword-only ``middlewares`` parameter when creating an
+:class:`Application`::
+
+   app = web.Application(middlewares=[middleware_factory_1,
+                                      middleware_factory_2])
+
+A *middleware factory* is simply a coroutine that implements the logic of a
+*middleware*. For example, here's a trivial *middleware factory*::
+
+    async def middleware_factory(app, handler):
+        async def middleware_handler(request):
+            return await handler(request)
+        return middleware_handler
+
+Every *middleware factory* should accept two parameters, an
+:class:`app <Application>` instance and a *handler*, and return a new handler.
+
+The *handler* passed in to a *middleware factory* is the handler returned by
+the **next** *middleware factory*. The last *middleware factory* always receives
+the :ref:`request handler <aiohttp-web-handler>` selected by the router itself
+(by :meth:`UrlDispatcher.resolve`).
+
+*Middleware factories* should return a new handler that has the same signature
+as a :ref:`request handler <aiohttp-web-handler>`. That is, it should accept a
+single :class:`Response` instance and return a :class:`Response`, or raise an
+exception.
+
+Internally, a single :ref:`request handler <aiohttp-web-handler>` is constructed
+by applying the middleware chain to the original handler in reverse order,
+and is called by the :class:`RequestHandler` as a regular *handler*.
+
+Since *middleware factories* are themselves coroutines, they may perform extra
+``await`` calls when creating a new handler, e.g. call database etc.
+
+*Middlewares* usually call the inner handler, but they may choose to ignore it,
+e.g. displaying *403 Forbidden page* or raising :exc:`HTTPForbidden` exception
+if user has no permissions to access the underlying resource.
+They may also render errors raised by the handler, perform some pre- or
+post-processing like handling *CORS* and so on.
+
+.. versionchanged:: 0.14
+   Middlewares accept route exceptions (:exc:`HTTPNotFound` and
+   :exc:`HTTPMethodNotAllowed`).
+
+Example
+.......
+
+A common use of middlewares is to implement custom error pages.  The following
+example will render 404 errors using a JSON response, as might be appropriate
+a JSON REST service:
+
+    import json
+    from aiohttp import web
+
+    def json_error(message):
+        return web.Response(
+            body=json.dumps({'error': message}).encode('utf-8'),
+            content_type='application/json')
+
+    async def error_middleware(app, handler):
+        async def middleware_handler(request):
+            try:
+                response = await handler(request)
+                if response.status == 404:
+                    return json_error(response.message)
+                return response
+            except web.HTTPException as ex:
+                if ex.status == 404:
+                    return json_error(ex.reason)
+                raise
+        return middleware_handler
+
+    app = web.Application(middlewares=[error_middleware])
+
+.. _aiohttp-web-signals:
+
+Signals
+-------
+
+.. versionadded:: 0.18
+
+Although :ref:`middlewares <aiohttp-web-middlewares>` can customize
+:ref:`request handlers<aiohttp-web-handler>` before or after a :class:`Response`
+has been prepared, they can't customize a :class:`Response` **while** it's
+being prepared. For this :mod:`aiohttp.web` provides *signals*.
+
+For example, a middleware can only change HTTP headers for *unprepared*
+responses (see :meth:`~aiohttp.web.StreamResponse.prepare`), but sometimes we
+need a hook for changing HTTP headers for streamed responses and WebSockets.
+This can be accomplished by subscribing to the
+:attr:`~aiohttp.web.Application.on_response_prepare` signal::
+
+    async def on_prepare(request, response):
+        response.headers['My-Header'] = 'value'
+
+    app.on_response_prepare.append(on_prepare)
+
+
+Signal handlers should not return a value but may modify incoming mutable
+parameters.
+
+
+.. warning::
+
+   Signals API has provisional status, meaning it may be changed in future
+   releases.
+
+   Signal subscription and sending will most likely be the same, but signal
+   object creation is subject to change. As long as you are not creating new
+   signals, but simply reusing existing ones, you will not be affected.
+
+
+.. _aiohttp-web-flow-control:
+
+Flow control
+------------
+
+:mod:`aiohttp.web` has sophisticated flow control for underlying TCP
+sockets write buffer.
+
+The problem is: by default TCP sockets use `Nagle's algorithm
+<https://en.wikipedia.org/wiki/Nagle%27s_algorithm>`_ for output
+buffer which is not optimal for streaming data protocols like HTTP.
+
+Web server response may have one of the following states:
+
+1. **CORK** (:attr:`~StreamResponse.tcp_cork` is ``True``).
+   Don't send out partial TCP/IP frames.  All queued partial frames
+   are sent when the option is cleared again. Optimal for sending big
+   portion of data since data will be sent using minimum
+   frames count.
+
+   If OS doesn't support **CORK** mode (neither ``socket.TCP_CORK``
+   nor ``socket.TCP_NOPUSH`` exists) the mode is equal to *Nagle's
+   enabled* one. The most widespread OS without **CORK** support is
+   *Windows*.
+
+2. **NODELAY** (:attr:`~StreamResponse.tcp_nodelay` is
+   ``True``).  Disable the Nagle algorithm.  This means that small
+   data pieces are always sent as soon as possible, even if there is
+   only a small amount of data. Optimal for transmitting short messages.
+
+3. Nagle's algorithm enabled (both
+   :attr:`~StreamResponse.tcp_cork` and
+   :attr:`~StreamResponse.tcp_nodelay` are ``False``).
+   Data is buffered until there is a sufficient amount to send out.
+   Avoid using this mode for sending HTTP data until you have no doubts.
+
+By default streaming data (:class:`StreamResponse`) and websockets
+(:class:`WebSocketResponse`) use **NODELAY** mode, regular responses
+(:class:`Response` and http exceptions derived from it) as well as
+static file handlers work in **CORK** mode.
+
+To manual mode switch :meth:`~StreamResponse.set_tcp_cork` and
+:meth:`~StreamResponse.set_tcp_nodelay` methods can be used.  It may
+be helpful for better streaming control for example.
+
+
+.. _aiohttp-web-graceful-shutdown:
+
+Graceful shutdown
+------------------
+
+Stopping *aiohttp web server* by just closing all connections is not
+always satisfactory.
+
+The problem is: if application supports :term:`websocket`\s or *data
+streaming* it most likely has open connections at server
+shutdown time.
+
+The *library* has no knowledge how to close them gracefully but
+developer can help by registering :attr:`Application.on_shutdown`
+signal handler and call the signal on *web server* closing.
+
+Developer should keep a list of opened connections
+(:class:`Application` is a good candidate).
+
+The following :term:`websocket` snippet shows an example for websocket
+handler::
+
+    app = web.Application()
+    app['websockets'] = []
+
+    async def websocket_handler(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        request.app['websockets'].append(ws)
+        try:
+            async for msg in ws:
+                ...
+        finally:
+            request.app['websockets'].remove(ws)
+
+        return ws
+
+Signal handler may looks like::
+
+    async def on_shutdown(app):
+        for ws in app['websockets']:
+            await ws.close(code=999, message='Server shutdown')
+
+    app.on_shutdown.append(on_shutdown)
+
+Proper finalization procedure has three steps:
+
+  1. Stop accepting new client connections by
+     :meth:`asyncio.Server.close` and
+     :meth:`asyncio.Server.wait_closed` calls.
+
+  2. Fire :meth:`Application.shutdown` event.
+
+  3. Close accepted connections from clients by
+     :meth:`RequestHandlerFactory.finish_connections` call with
+     reasonable small delay.
+
+  4. Call registered application finalizers by :meth:`Application.cleanup`.
+
+The following code snippet performs proper application start, run and
+finalizing.  It's pretty close to :func:`run_app` utility function::
+
+   loop = asyncio.get_event_loop()
+   handler = app.make_handler()
+   f = loop.create_server(handler, '0.0.0.0', 8080)
+   srv = loop.run_until_complete(f)
+   print('serving on', srv.sockets[0].getsockname())
+   try:
+       loop.run_forever()
+   except KeyboardInterrupt:
+       pass
+   finally:
+       srv.close()
+       loop.run_until_complete(srv.wait_closed())
+       loop.run_until_complete(app.shutdown())
+       loop.run_until_complete(handler.finish_connections(60.0))
+       loop.run_until_complete(app.cleanup())
+   loop.close()
+
+
+CORS support
+------------
+
+:mod:`aiohttp.web` itself does not support `Cross-Origin Resource
+Sharing <https://en.wikipedia.org/wiki/Cross-origin_resource_sharing>`_, but
+there is a aiohttp plugin for it:
+`aiohttp_cors <https://github.com/aio-libs/aiohttp_cors>`_.
+
+
+Debug Toolbar
+-------------
+
+aiohttp_debugtoolbar_ is a very useful library that provides a debugging toolbar
+while you're developing an :mod:`aiohttp.web` application.
+
+Install it via ``pip``::
+
+    $ pip install aiohttp_debugtoolbar
+
+
+After that attach the :mod:`aiohttp_debugtoolbar` middleware to your
+:class:`aiohttp.web.Application` and call :func:`aiohttp_debugtoolbar.setup`::
+
+    import aiohttp_debugtoolbar
+    from aiohttp_debugtoolbar import toolbar_middleware_factory
+
+    app = web.Application(loop=loop,
+                          middlewares=[toolbar_middleware_factory])
+    aiohttp_debugtoolbar.setup(app)
+
+The toolbar is ready to use. Enjoy!!!
+
+.. _aiohttp_debugtoolbar: https://github.com/aio-libs/aiohttp_debugtoolbar
+
+
+.. disqus::

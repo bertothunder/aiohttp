@@ -1,13 +1,18 @@
-__all__ = ['EofStream',
-           'StreamReader', 'DataQueue', 'ChunksQueue',
-           'FlowControlStreamReader', 'FlowControlDataQueue',
-           'FlowControlChunksQueue']
-
+import sys
 import asyncio
 import collections
+import functools
 import traceback
 
 from .log import internal_logger
+from . import helpers
+
+__all__ = (
+    'EofStream', 'StreamReader', 'DataQueue', 'ChunksQueue',
+    'FlowControlStreamReader',
+    'FlowControlDataQueue', 'FlowControlChunksQueue')
+
+PY_35 = sys.version_info >= (3, 5)
 
 EOF_MARKER = b''
 DEFAULT_LIMIT = 2 ** 16
@@ -17,7 +22,64 @@ class EofStream(Exception):
     """eof stream indication."""
 
 
-class StreamReader(asyncio.StreamReader):
+class AsyncStreamIterator:
+
+    def __init__(self, read_func):
+        self.read_func = read_func
+
+    @asyncio.coroutine
+    def __aiter__(self):
+        return self
+
+    @asyncio.coroutine
+    def __anext__(self):
+        try:
+            rv = yield from self.read_func()
+        except EofStream:
+            raise StopAsyncIteration  # NOQA
+        if rv == EOF_MARKER:
+            raise StopAsyncIteration  # NOQA
+        return rv
+
+
+class AsyncStreamReaderMixin:
+
+    if PY_35:
+        @asyncio.coroutine
+        def __aiter__(self):
+            return AsyncStreamIterator(self.readline)
+
+        def iter_chunked(self, n):
+            """Returns an asynchronous iterator that yields chunks of size n.
+
+            Python-3.5 available for Python 3.5+ only
+            """
+            return AsyncStreamIterator(lambda: self.read(n))
+
+        def iter_any(self):
+            """Returns an asynchronous iterator that yields slices of data
+            as they come.
+
+            Python-3.5 available for Python 3.5+ only
+            """
+            return AsyncStreamIterator(self.readany)
+
+
+class StreamReader(asyncio.StreamReader, AsyncStreamReaderMixin):
+    """An enhancement of :class:`asyncio.StreamReader`.
+
+    Supports asynchronous iteration by line, chunk or as available::
+
+        async for line in reader:
+            ...
+        async for chunk in reader.iter_chunked(1024):
+            ...
+        async for slice in reader.iter_any():
+            ...
+
+    .. automethod:: AsyncStreamReaderMixin.iter_chunked
+    .. automethod:: AsyncStreamReaderMixin.iter_any
+    """
 
     total_bytes = 0
 
@@ -26,11 +88,27 @@ class StreamReader(asyncio.StreamReader):
         if loop is None:
             loop = asyncio.get_event_loop()
         self._loop = loop
-        self._buffer = bytearray()
+        self._buffer = collections.deque()
+        self._buffer_size = 0
+        self._buffer_offset = 0
         self._eof = False
         self._waiter = None
         self._eof_waiter = None
         self._exception = None
+
+    def __repr__(self):
+        info = ['StreamReader']
+        if self._buffer_size:
+            info.append('%d bytes' % self._buffer_size)
+        if self._eof:
+            info.append('eof')
+        if self._limit != DEFAULT_LIMIT:
+            info.append('l=%d' % self._limit)
+        if self._waiter:
+            info.append('w=%r' % self._waiter)
+        if self._exception:
+            info.append('e=%r' % self._exception)
+        return '<%s>' % ' '.join(info)
 
     def exception(self):
         return self._exception
@@ -73,11 +151,23 @@ class StreamReader(asyncio.StreamReader):
             return
 
         assert self._eof_waiter is None
-        self._eof_waiter = asyncio.Future(loop=self._loop)
+        self._eof_waiter = helpers.create_future(self._loop)
         try:
             yield from self._eof_waiter
         finally:
             self._eof_waiter = None
+
+    def unread_data(self, data):
+        """ rollback reading some data from stream, inserting it to buffer head.
+        """
+        if not data:
+            return
+
+        if self._buffer_offset:
+            self._buffer[0] = self._buffer[0][self._buffer_offset:]
+            self._buffer_offset = 0
+        self._buffer.appendleft(data)
+        self._buffer_size += len(data)
 
     def feed_data(self, data):
         assert not self._eof, 'feed_data after feed_eof'
@@ -85,7 +175,8 @@ class StreamReader(asyncio.StreamReader):
         if not data:
             return
 
-        self._buffer.extend(data)
+        self._buffer.append(data)
+        self._buffer_size += len(data)
         self.total_bytes += len(data)
 
         waiter = self._waiter
@@ -102,29 +193,29 @@ class StreamReader(asyncio.StreamReader):
         if self._waiter is not None:
             raise RuntimeError('%s() called while another coroutine is '
                                'already waiting for incoming data' % func_name)
-        return asyncio.Future(loop=self._loop)
+        return helpers.create_future(self._loop)
 
     @asyncio.coroutine
     def readline(self):
         if self._exception is not None:
             raise self._exception
 
-        line = bytearray()
+        line = []
+        line_size = 0
         not_enough = True
 
         while not_enough:
             while self._buffer and not_enough:
-                ichar = self._buffer.find(b'\n')
-                if ichar < 0:
-                    line.extend(self._buffer)
-                    self._buffer.clear()
-                else:
-                    ichar += 1
-                    line.extend(self._buffer[:ichar])
-                    del self._buffer[:ichar]
+                offset = self._buffer_offset
+                ichar = self._buffer[0].find(b'\n', offset) + 1
+                # Read from current offset to found b'\n' or to the end.
+                data = self._read_nowait(ichar - offset if ichar else 0)
+                line.append(data)
+                line_size += len(data)
+                if ichar:
                     not_enough = False
 
-                if len(line) > self._limit:
+                if line_size > self._limit:
                     raise ValueError('Line is too long')
 
             if self._eof:
@@ -137,10 +228,7 @@ class StreamReader(asyncio.StreamReader):
                 finally:
                     self._waiter = None
 
-        if line:
-            return bytes(line)
-        else:
-            return EOF_MARKER
+        return b''.join(line)
 
     @asyncio.coroutine
     def read(self, n=-1):
@@ -167,38 +255,23 @@ class StreamReader(asyncio.StreamReader):
             # This used to just loop creating a new waiter hoping to
             # collect everything in self._buffer, but that would
             # deadlock if the subprocess sends more than self.limit
-            # bytes.  So just call self.read(self._limit) until EOF.
+            # bytes.  So just call self.readany() until EOF.
             blocks = []
             while True:
-                block = yield from self.read(self._limit)
+                block = yield from self.readany()
                 if not block:
                     break
                 blocks.append(block)
-            data = b''.join(blocks)
-            if data:
-                return data
-            else:
-                return EOF_MARKER
-        else:
-            if not self._buffer and not self._eof:
-                self._waiter = self._create_waiter('read')
-                try:
-                    yield from self._waiter
-                finally:
-                    self._waiter = None
+            return b''.join(blocks)
 
-        if n < 0 or len(self._buffer) <= n:
-            data = bytes(self._buffer)
-            self._buffer.clear()
-        else:
-            # n > 0 and len(self._buffer) > n
-            data = bytes(self._buffer[:n])
-            del self._buffer[:n]
+        if not self._buffer and not self._eof:
+            self._waiter = self._create_waiter('read')
+            try:
+                yield from self._waiter
+            finally:
+                self._waiter = None
 
-        if data:
-            return data
-        else:
-            return EOF_MARKER
+        return self._read_nowait(n)
 
     @asyncio.coroutine
     def readany(self):
@@ -212,13 +285,7 @@ class StreamReader(asyncio.StreamReader):
             finally:
                 self._waiter = None
 
-        data = bytes(self._buffer)
-        del self._buffer[:]
-
-        if data:
-            return data
-        else:
-            return EOF_MARKER
+        return self._read_nowait()
 
     @asyncio.coroutine
     def readexactly(self, n):
@@ -244,7 +311,7 @@ class StreamReader(asyncio.StreamReader):
 
         return b''.join(blocks)
 
-    def read_nowait(self):
+    def read_nowait(self, n=None):
         if self._exception is not None:
             raise self._exception
 
@@ -252,52 +319,72 @@ class StreamReader(asyncio.StreamReader):
             raise RuntimeError(
                 'Called while some coroutine is waiting for incoming data.')
 
+        return self._read_nowait(n)
+
+    def _read_nowait(self, n=None):
         if not self._buffer:
             return EOF_MARKER
+
+        first_buffer = self._buffer[0]
+        offset = self._buffer_offset
+        if n and len(first_buffer) - offset > n:
+            data = first_buffer[offset:offset + n]
+            self._buffer_offset += n
+
+        elif offset:
+            self._buffer.popleft()
+            data = first_buffer[offset:]
+            self._buffer_offset = 0
+
         else:
-            data = bytes(self._buffer)
-            del self._buffer[:]
-            return data
+            data = self._buffer.popleft()
+
+        self._buffer_size -= len(data)
+        return data
 
 
-class FlowControlStreamReader(StreamReader):
+class EmptyStreamReader(AsyncStreamReaderMixin):
 
-    def __init__(self, stream, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def exception(self):
+        return None
 
-        self._stream = stream
+    def set_exception(self, exc):
+        pass
+
+    def feed_eof(self):
+        pass
+
+    def is_eof(self):
+        return True
+
+    def at_eof(self):
+        return True
 
     @asyncio.coroutine
-    def read(self, n=-1):
-        self._stream.resume_stream()
-        try:
-            return (yield from super().read(n))
-        finally:
-            self._stream.pause_stream()
+    def wait_eof(self):
+        return
+
+    def feed_data(self, data):
+        pass
 
     @asyncio.coroutine
     def readline(self):
-        self._stream.resume_stream()
-        try:
-            return (yield from super().readline())
-        finally:
-            self._stream.pause_stream()
+        return EOF_MARKER
+
+    @asyncio.coroutine
+    def read(self, n=-1):
+        return EOF_MARKER
 
     @asyncio.coroutine
     def readany(self):
-        self._stream.resume_stream()
-        try:
-            return (yield from super().readany())
-        finally:
-            self._stream.pause_stream()
+        return EOF_MARKER
 
     @asyncio.coroutine
     def readexactly(self, n):
-        self._stream.resume_stream()
-        try:
-            return (yield from super().readexactly(n))
-        finally:
-            self._stream.pause_stream()
+        raise asyncio.streams.IncompleteReadError(b'', n)
+
+    def read_nowait(self):
+        return EOF_MARKER
 
 
 class DataQueue:
@@ -305,10 +392,11 @@ class DataQueue:
 
     def __init__(self, *, loop=None):
         self._loop = loop
-        self._buffer = collections.deque()
         self._eof = False
         self._waiter = None
         self._exception = None
+        self._size = 0
+        self._buffer = collections.deque()
 
     def is_eof(self):
         return self._eof
@@ -328,8 +416,9 @@ class DataQueue:
             if not waiter.done():
                 waiter.set_exception(exc)
 
-    def feed_data(self, data):
-        self._buffer.append(data)
+    def feed_data(self, data, size=0):
+        self._size += size
+        self._buffer.append((data, size))
 
         waiter = self._waiter
         if waiter is not None:
@@ -353,35 +442,27 @@ class DataQueue:
                 raise self._exception
 
             assert not self._waiter
-            self._waiter = asyncio.Future(loop=self._loop)
-            yield from self._waiter
+            self._waiter = helpers.create_future(self._loop)
+            try:
+                yield from self._waiter
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                self._waiter = None
+                raise
 
         if self._buffer:
-            return self._buffer.popleft()
+            data, size = self._buffer.popleft()
+            self._size -= size
+            return data
         else:
             if self._exception is not None:
                 raise self._exception
             else:
                 raise EofStream
 
-
-class FlowControlDataQueue(DataQueue):
-    """FlowControlDataQueue resumes and pauses an underlying stream.
-
-    It is a destination for parsed data."""
-
-    def __init__(self, stream, *, loop=None):
-        super().__init__(loop=loop)
-
-        self._stream = stream
-
-    @asyncio.coroutine
-    def read(self):
-        self._stream.resume_stream()
-        try:
-            return (yield from super().read())
-        finally:
-            self._stream.pause_stream()
+    if PY_35:
+        @asyncio.coroutine
+        def __aiter__(self):
+            return AsyncStreamIterator(self.read)
 
 
 class ChunksQueue(DataQueue):
@@ -397,7 +478,146 @@ class ChunksQueue(DataQueue):
     readany = read
 
 
-class FlowControlChunksQueue(FlowControlDataQueue, ChunksQueue):
-    """FlowControlChunksQueue resumes and pauses an underlying stream."""
+def maybe_resume(func):
 
-    readany = FlowControlDataQueue.read
+    @asyncio.coroutine
+    @functools.wraps(func)
+    def wrapper(self, *args, **kw):
+        result = yield from func(self, *args, **kw)
+
+        if self._stream.paused:
+            if self._buffer_size < self._b_limit:
+                try:
+                    self._stream.transport.resume_reading()
+                except (AttributeError, NotImplementedError):
+                    pass
+                else:
+                    self._stream.paused = False
+        else:
+            if self._buffer_size > self._b_limit:
+                try:
+                    self._stream.transport.pause_reading()
+                except (AttributeError, NotImplementedError):
+                    pass
+                else:
+                    self._stream.paused = True
+
+        return result
+
+    return wrapper
+
+
+class FlowControlStreamReader(StreamReader):
+
+    def __init__(self, stream, limit=DEFAULT_LIMIT, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self._stream = stream
+        self._b_limit = limit * 2
+
+        # resume transport reading
+        if stream.paused:
+            try:
+                self._stream.transport.resume_reading()
+            except (AttributeError, NotImplementedError):
+                pass
+
+    def feed_data(self, data, size=0):
+        has_waiter = self._waiter is not None and not self._waiter.cancelled()
+
+        super().feed_data(data)
+
+        if (not self._stream.paused and
+                not has_waiter and self._buffer_size > self._b_limit):
+            try:
+                self._stream.transport.pause_reading()
+            except (AttributeError, NotImplementedError):
+                pass
+            else:
+                self._stream.paused = True
+
+    @maybe_resume
+    def read(self, n=-1):
+        return (yield from super().read(n))
+
+    @maybe_resume
+    def readline(self):
+        return (yield from super().readline())
+
+    @maybe_resume
+    def readany(self):
+        return (yield from super().readany())
+
+    @maybe_resume
+    def readexactly(self, n):
+        return (yield from super().readexactly(n))
+
+
+class FlowControlDataQueue(DataQueue):
+    """FlowControlDataQueue resumes and pauses an underlying stream.
+
+    It is a destination for parsed data."""
+
+    def __init__(self, stream, *, limit=DEFAULT_LIMIT, loop=None):
+        super().__init__(loop=loop)
+
+        self._stream = stream
+        self._limit = limit * 2
+
+        # resume transport reading
+        if stream.paused:
+            try:
+                self._stream.transport.resume_reading()
+            except (AttributeError, NotImplementedError):
+                pass
+            else:
+                self._stream.paused = False
+
+    def feed_data(self, data, size):
+        has_waiter = self._waiter is not None and not self._waiter.cancelled()
+
+        super().feed_data(data, size)
+
+        if (not self._stream.paused and
+                not has_waiter and self._size > self._limit):
+            try:
+                self._stream.transport.pause_reading()
+            except (AttributeError, NotImplementedError):
+                pass
+            else:
+                self._stream.paused = True
+
+    @asyncio.coroutine
+    def read(self):
+        result = yield from super().read()
+
+        if self._stream.paused:
+            if self._size < self._limit:
+                try:
+                    self._stream.transport.resume_reading()
+                except (AttributeError, NotImplementedError):
+                    pass
+                else:
+                    self._stream.paused = False
+        else:
+            if self._size > self._limit:
+                try:
+                    self._stream.transport.pause_reading()
+                except (AttributeError, NotImplementedError):
+                    pass
+                else:
+                    self._stream.paused = True
+
+        return result
+
+
+class FlowControlChunksQueue(FlowControlDataQueue):
+
+    @asyncio.coroutine
+    def read(self):
+        try:
+            return (yield from super().read())
+        except EofStream:
+            return EOF_MARKER
+
+    readany = read
